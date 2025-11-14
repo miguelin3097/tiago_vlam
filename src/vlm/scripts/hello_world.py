@@ -481,6 +481,7 @@ class CaptureWindow(QtWidgets.QWidget):
 
 
     def _annotate_image_with_plan(self, img_path: str, plan_dict: dict):
+        rospy.loginfo("He entrado a la funcion de anotar imagen")
         """
         Si plan_dict está vacío -> muestra la imagen tal cual.
         Si tiene datos -> dibuja:
@@ -499,8 +500,14 @@ class CaptureWindow(QtWidgets.QWidget):
 
         # Si no hay plan -> solo mostrar
         if not plan_dict:
+            rospy.loginfo("He entrado al if de cuando no hay plan")
+            #rospy.loginfo(img)
             self._show_qimage_from_cv(img, self.firstImgLbl)
+            self.countdownLbl.setText("Waiting response...")
             self.firstImgLbl.setToolTip("RESET photo")
+            QtWidgets.QApplication.processEvents()
+            
+            
             return
 
         h, w = img.shape[:2]
@@ -607,8 +614,9 @@ class CaptureWindow(QtWidgets.QWidget):
         #            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
         # Mostrar en primer hueco (sin _save_and_show)
-        self._show_qimage_from_cv(img, self.firstImgLbl)
-        self.firstImgLbl.setToolTip("RESET photo with plan overlay")
+        self._show_qimage_from_cv(img, self.secondImgLbl)
+        self.secondImgLbl.setToolTip("RESET photo with plan overlay")
+        self.countdownLbl.setText("Plan Ready!")
 
 
 

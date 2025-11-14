@@ -8,7 +8,11 @@ import rospy
 import requests
 from PIL import Image
 
+from vlm.env_loader import load_env_file
+
 from vlm.srv import PlanAction, PlanActionResponse
+
+load_env_file("vlm")
 
 # Configuración del modelo Gemini
 GEMINI_MODEL = "gemini-robotics-er-1.5-preview"
@@ -67,7 +71,7 @@ def handle_plan_action(req):
         # Verifica apertura (feedback temprano)
         Image.open(req.image_path)
 
-        api_key = os.environ.get("GOOGLE_API_KEY", "")
+        api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             resp.error = "Falta GOOGLE_API_KEY en el entorno"
             return resp

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+
 import os
 import base64
 import json
@@ -8,7 +9,12 @@ from PIL import Image  # solo para verificar que abre
 import rospy
 import requests
 
+from vlm.env_loader import load_env_file
+
 from vlm.srv import GeminiAnalyze, GeminiAnalyzeResponse
+
+load_env_file("vlm")
+
 
 # Modelo de Gemini (puedes cambiar a gemini-1.5-flash si quieres más rapidez)
 GEMINI_MODEL = "gemini-robotics-er-1.5-preview"
@@ -66,7 +72,7 @@ def handle_analyze(req):
         Image.open(req.image1_path)
         Image.open(req.image2_path)
 
-        api_key = os.environ.get("GOOGLE_API_KEY", "")
+        api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             resp.error = "Falta GOOGLE_API_KEY en el entorno"
             return resp

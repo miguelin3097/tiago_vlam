@@ -1,9 +1,9 @@
 <launch>
 
     <!-- 1) Lanzar la simulación TIAGo en Gazebo -->
-    <include file="$(find tiago_gazebo)/launch/tiago_gazebo.launch">
+    <!--<include file="$(find tiago_gazebo)/launch/tiago_gazebo.launch">
         <arg name="world" value="objects_on_table" />
-    </include>
+    </include>-->
 
     <!-- 2) Lanzar tus nodos -->
     <node pkg="vlm" type="hello_world.py" name="gui" output="screen"/>
