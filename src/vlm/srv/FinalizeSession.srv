@@ -1,0 +1,32 @@
+# ===== Request =====
+string session_id
+string exercise_type
+string prompt
+string camera_topic
+
+time started_at
+time ended_at
+
+string image_start_path
+string image_end_path
+
+string[] gt_order
+string[] pred_order
+bool     vlm_is_correct
+
+string vlm_model
+string vlm_raw_answer
+int32  vlm_latency_ms
+
+# base de salida; si vacío -> ~/.ros/rehab_sessions
+string output_base_dir
+
+# mover (true) o copiar (false) imágenes
+bool move_files
+
+# ===== Response =====
+---
+bool   success
+string session_dir       # ruta final guardada
+string manifest_json     # manifest completo en JSON para mostrar/usar en la GUI
+string error

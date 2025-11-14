@@ -1,0 +1,7 @@
+string image1_path
+string image2_path
+string prompt
+---
+bool success
+string answer
+string error

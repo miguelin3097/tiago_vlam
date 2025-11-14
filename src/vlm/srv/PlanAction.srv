@@ -1,0 +1,7 @@
+string image_path
+string prompt
+
+---
+bool ok
+string error
+string plan_json
