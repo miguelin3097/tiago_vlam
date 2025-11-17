@@ -175,6 +175,7 @@ catkin_install_python(PROGRAMS
    scripts/gemini_vision_server.py
    scripts/metrics_server.py
    scripts/plan_action_server.py
+   scripts/pick_and_place.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
