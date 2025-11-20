@@ -15,7 +15,7 @@ from PyQt5.QtGui import QDoubleValidator, QFont
 
 # --- CONFIGURATION ---
 READY_JOINTS = [0.629, 0.009, 1.637, 1.168, 1.093, -1.339, -1.506]
-DEFAULT_ROT = {'r': 90.0, 'p': 90.0, 'y': 0.0}
+DEFAULT_ROT = {'r': 90.0, 'p': 30.0, 'y': 90.0}
 
 # --- WORKER THREAD ---
 class WorkerThread(QThread):
@@ -47,6 +47,7 @@ class RobotController:
         self.arm_group = moveit_commander.MoveGroupCommander("arm_right")
         self.gripper_group = moveit_commander.MoveGroupCommander("gripper_right")
         self.torso_group = moveit_commander.MoveGroupCommander("torso")
+        print(f"\n\n[INFO] REFERENCE FRAME {self.arm_group.get_planning_frame()}\n\n")
         
         self.arm_group.set_planning_time(5.0)
         self.arm_group.set_num_planning_attempts(10)
@@ -67,6 +68,7 @@ class RobotController:
 
     def _create_pose(self, x, y, z, r_deg, p_deg, y_deg):
         planning_frame = self.arm_group.get_planning_frame()
+        
         pose = PoseStamped()
         pose.header.frame_id = planning_frame
         pose.header.stamp = rospy.Time.now()
