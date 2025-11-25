@@ -15,6 +15,8 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   sensor_msgs
   cv_bridge
+  actionlib
+  actionlib_msgs
 )
 
 ## System dependencies are found with CMake's conventions
@@ -67,19 +69,22 @@ FILES
 GeminiAnalyze.srv
 FinalizeSession.srv
 PlanAction.srv
+TransformPose.srv
 )
 
 ## Generate actions in the 'action' folder
-# add_action_files(
-#   FILES
+add_action_files(
+   FILES
 #   Action1.action
 #   Action2.action
-# )
+    PickUp.action
+)
 
 ## Generate added messages and services with any dependencies listed here
 generate_messages(
    DEPENDENCIES
    std_msgs  # Or other packages containing msgs
+   actionlib_msgs
 )
 
 ################################################
@@ -117,7 +122,7 @@ catkin_package(
 #  CATKIN_DEPENDS roscpp rospy
 #  DEPENDS system_lib
 CATKIN_DEPENDS
-    rospy roscpp std_msgs sensor_msgs cv_bridge message_runtime
+    rospy roscpp std_msgs sensor_msgs cv_bridge message_runtime actionlib_msgs
 )
 
 ###########
@@ -177,6 +182,8 @@ catkin_install_python(PROGRAMS
    scripts/plan_action_server.py
    scripts/pick_and_place.py
    scripts/depth_transform.py
+   scripts/pickup_server.py
+   scripts/transform_server.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

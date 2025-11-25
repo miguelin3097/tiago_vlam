@@ -11,25 +11,35 @@ from pathlib import Path
 import cv2
 
 import rospy
+import actionlib  # <--- NUEVO: Necesario para ActionClient
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
-# Servicios (si alguno no está instalado/compilado aún, la GUI lo maneja con try/except)
+# Servicios VLM (Gemini)
 try:
     from vlm.srv import GeminiAnalyze, GeminiAnalyzeRequest
     HAS_GEMINI = True
 except Exception:
     HAS_GEMINI = False
 
-# Servicios PlanAction (nuevo)
+# Servicios PlanAction (Planificación Visual)
 try:
     from vlm.srv import PlanAction, PlanActionRequest
     HAS_PLAN_ACTION = True
 except Exception:
     HAS_PLAN_ACTION = False
 
-
+# Servicios de Sesión
 from vlm.srv import FinalizeSession, FinalizeSessionRequest
+
+# --- NUEVO: Servicios y Acciones para el Robot (Transformación y PickUp) ---
+try:
+    from vlm.srv import TransformPose, TransformPoseRequest
+    from vlm.msg import PickUpAction, PickUpGoal
+    HAS_ROBOT_MODULES = True
+except Exception:
+    HAS_ROBOT_MODULES = False
+    print("WARNING: No se encontraron los mensajes de vlm (TransformPose o PickUpAction).")
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -58,90 +68,24 @@ def normalize_color(token: str) -> str:
     token = (token or "").strip().lower()
     return COLOR_MAP.get(token, token)
 
-#def parse_predicted_order(answer_text: str):
-#    """
-#    Extrae una secuencia de colores de la respuesta del VLM.
-#    Acepta formatos como:
-#      - "Orden: rojo, verde, azul"
-#      - "Left to right: red -> green -> blue"
-#      - "The order is red, green and blue."
-#    Devuelve (lista_colores_normalizados, flag_is_correct)
-#    """
-#    if not answer_text:
-#        return [], None
-#
-#    txt = answer_text.strip().lower()
-#
-#    # Detecta 'correcto/incorrecto'
-#    is_correct = None
-#    if re.search(r"\b(correcto|correcta|es correcto|orden.*correcto)\b", txt):
-#        is_correct = True
-#    elif re.search(r"\b(incorrecto|incorrecta|no.*correcto|orden.*incorrecto)\b", txt):
-#        is_correct = False
-#    elif re.search(r"\b(correct|is correct)\b", txt):
-#        is_correct = True
-#    elif re.search(r"\b(incorrect|not correct)\b", txt):
-#        is_correct = False
-#
-#    # Busca una línea/segmento que parezca enumerar colores
-#    # Primero intenta tras palabras clave
-#    candidates = []
-#    key_patterns = [
-#        r"(?:orden|order|left to right|de izquierda a derecha)\s*[:\-]\s*(.*)",
-#        r"(?:es|is|are)\s*(.*)"  # fallback
-#    ]
-#    for pat in key_patterns:
-#        m = re.search(pat, txt)
-#        if m:
-#            candidates.append(m.group(1))
-#
-#    # si no hay candidatos, usa el texto completo
-#    if not candidates:
-#        candidates = [txt]
-#
-#    best_seq = []
-#    for segment in candidates:
-#        # separadores comunes
-#        parts = re.split(r"[,\;\|\>]| y | and ", segment)
-#        seq = []
-#        for p in parts:
-#            for m in COLOR_REGEX.finditer(p):
-#                seq.append(normalize_color(m.group(1)))
-#        # filtra repetidos consecutivos triviales
-#        seq_clean = []
-#        for c in seq:
-#            if not seq_clean or seq_clean[-1] != c:
-#                seq_clean.append(c)
-#        if len(seq_clean) > len(best_seq):
-#            best_seq = seq_clean
-#
-#    # como fallback absoluto: saca todos los colores en orden de aparición
-#    if not best_seq:
-#        seq = [normalize_color(m.group(1)) for m in COLOR_REGEX.finditer(txt)]
-#        if seq:
-#            best_seq = seq
-#
-#    return best_seq, is_correct
-
-
 def parse_predicted_order(answer_text: str):
     """
-    Extrae una secuencia de colores de la respuesta del VLM.
-    Acepta formatos como:
-      - "Orden: rojo, verde, azul"
-      - "Left to right: red -> green -> blue"
-      - "The order is red, green and blue."
-    Devuelve (lista_colores_normalizados, flag_is_correct)
+    Extrae orden y assessment del JSON de respuesta.
     """
     if not answer_text:
         return [], None
 
     txt = answer_text.strip().lower()
-
-    answer_json=json.loads(txt)
-
-
-    return answer_json["order"], answer_json["assestment"]
+    # Intento básico de limpiar markdown si el modelo lo mete
+    if txt.startswith("```json"):
+        txt = txt.replace("```json", "").replace("```", "")
+    
+    try:
+        answer_json = json.loads(txt)
+        return answer_json.get("order", []), answer_json.get("assestment", None)
+    except json.JSONDecodeError:
+        rospy.logwarn(f"Error decodificando JSON del VLM: {txt[:50]}...")
+        return [], None
 
 
 # =========================
@@ -172,29 +116,19 @@ class ImageBuffer(object):
 # =========================
 DEFAULT_TOPIC = "/xtion/rgb/image_raw"
 DEFAULT_PROMPT = (
-    "Look at the final image and note the order of the cubes from left to right. The cubes must form a straight horizontal line; those not in this line will not count. The answer format must be strictly JSON, where the first key-value pair is the order of the colors from left to right in list form with the key name 'order', and the second key-value pair is your assessment of whether they are correctly ordered, taking into account the GT which is [GT], the key name is 'assestment' and it always will be a boolean value. If you don't know the order of the colors, the answer will be -1. Return only valid JSON, without Markdown, code fences, or explanations — the response must start with { and end with }."
+    "Look at the final image and note the order of the cubes from left to right. "
+    "The cubes must form a straight horizontal line. "
+    "The answer format must be strictly JSON with keys 'order' (list of colors) and "
+    "'assestment' (boolean, true if matches GT: [GT]). Return only valid JSON."
 )
 DEFAULT_PLAN_PROMPT = (
     "Analyze the image. There are colored cubes on a table. "
-    "Return STRICT JSON (no markdown, no comments). Start with '{' and end with '}'. "
-    "JSON schema:\n"
-    "{\n"
-    "  \"cubes\": [{\"color\": \"<color>\", \"yx\": [<int_y_0_1000>, <int_x_0_1000>]}],\n"
-    "  \"order\": [\"<color1>\", \"<color2>\", ...],\n"
-    "  \"targets\": {\"<color>\": {\"yx\": [<int_y_0_1000>, <int_x_0_1000>] }},\n"
-    "  \"image_size\": {\"width\": <int>, \"height\": <int>}\n"
-    "}\n"
-    "Coordinate system: origin at top-left (x right, y down). "
-    "ALL coordinates MUST be normalized integers in the range 0..1000 and returned in [y, x] order inside 'yx'. "
-    "Targets represent the DESIRED FINAL POSITIONS and MUST NOT coincide with any current cube position "
-    "(keep a minimum Euclidean distance of 40 pixels at 640x480; scale this threshold with the image size). "
-    "Arrange targets in a straight horizontal line (same y), left-to-right following 'order', "
-    "using reasonable margins (≈8% of width) and equal spacing across the available width. "
-    "Colors must be one of: red, green, blue, yellow, orange, purple, pink, black, white, brown, gray."
+    "Return STRICT JSON. Schema: "
+    "{'cubes': [{'color': '...', 'yx': [y, x]}], 'order': ['...'], 'targets': {'color': {'yx': [y, x]}}, "
+    "'image_size': {'width': w, 'height': h}}. Coordinates 0-1000 normalized."
 )
 
 NORM_SCALE = 1000  # el modelo devuelve y,x en 0..1000
-
 
 # Colores BGR para pintar sobre la imagen
 COLOR_TO_BGR = {
@@ -211,8 +145,6 @@ COLOR_TO_BGR = {
     "gray":   (128, 128, 128),
 }
 
-
-
 def iso_utc(dt: datetime.datetime):
     return dt.replace(microsecond=0).isoformat() + "Z"
 
@@ -223,16 +155,22 @@ class CaptureWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TIAGo Rehab — Photo & Session GUI")
-        self.resize(1024, 680)
+        self.resize(1024, 700)
 
         # ---------- Widgets ----------
         self.topicEdit = QtWidgets.QLineEdit(DEFAULT_TOPIC)
         self.exerciseEdit = QtWidgets.QLineEdit("table_sorting_left_to_right")
-        self.gtEdit = QtWidgets.QLineEdit("red, green, blue, yellow")  # GT esperado (coma-separado)
+        self.gtEdit = QtWidgets.QLineEdit("red, green, blue, yellow")
         self.promptEdit = QtWidgets.QPlainTextEdit(DEFAULT_PROMPT)
 
-        self.btnStart  = QtWidgets.QPushButton("Start (5s → photo, 60s → photo)")
-        self.btnReset = QtWidgets.QPushButton("Reset (photo → plan)")
+        self.btnStart  = QtWidgets.QPushButton("Start Session (5s → 60s)")
+        self.btnReset = QtWidgets.QPushButton("Reset (Plan)")
+        
+        # --- NUEVO BOTÓN ---
+        self.btnExecute = QtWidgets.QPushButton("EXECUTE ON ROBOT (Right->Left)")
+        self.btnExecute.setStyleSheet("background-color: #FF9800; font-weight: bold; color: white;")
+        self.btnExecute.setEnabled(False) # Se activa solo tras Reset
+        
         self.planOut = QtWidgets.QPlainTextEdit()
         self.planOut.setReadOnly(True)
         self.planOut.setPlaceholderText("Plan output (JSON)")
@@ -257,13 +195,13 @@ class CaptureWindow(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout()
         form.addRow("Image topic:", self.topicEdit)
         form.addRow("Exercise type:", self.exerciseEdit)
-        form.addRow("GT order (comma-separated):", self.gtEdit)
+        form.addRow("GT order:", self.gtEdit)
 
         top = QtWidgets.QHBoxLayout()
         top.addLayout(form, 1)
         top.addWidget(self.btnStart, 0)
         top.addWidget(self.btnReset, 0)
-
+        top.addWidget(self.btnExecute, 0) # Añadimos el botón al layout
 
         imgs = QtWidgets.QHBoxLayout()
         imgs.addWidget(self.firstImgLbl, 1)
@@ -278,6 +216,7 @@ class CaptureWindow(QtWidgets.QWidget):
         main.addWidget(self.countdownLbl)
         main.addLayout(imgs)
         main.addWidget(promptBox)
+        
         planBox = QtWidgets.QGroupBox("Plan (LLM)")
         vb2 = QtWidgets.QVBoxLayout(planBox)
         vb2.addWidget(self.planOut)
@@ -310,17 +249,18 @@ class CaptureWindow(QtWidgets.QWidget):
         self.pred_is_correct = None
 
         self.reset_path = None
-
+        
+        # --- Estado para el Robot ---
+        self.current_plan = None
+        self.ac_pickup = None      # Cliente Acción PickUp
+        self.srv_transform = None  # Cliente Servicio Transformación
 
         # ---------- Señales ----------
         self.btnStart.clicked.connect(self.on_start_clicked)
         self.btnReset.clicked.connect(self.on_reset_clicked)
+        self.btnExecute.clicked.connect(self.on_execute_clicked) # Conexión nueva
 
-        # Suscríbete nada más abrir la GUI
         self.start_sub()
-        # Re-suscripción si el usuario edita el topic y pulsa Enter o cambia el foco
-        #self.topicEdit.editingFinished.connect(self.start_sub)
-
 
     # ----- ROS subscribe -----
     def start_sub(self):
@@ -331,7 +271,6 @@ class CaptureWindow(QtWidgets.QWidget):
         self.sub = rospy.Subscriber(topic, Image, self.img_buffer.update, queue_size=1)
         rospy.loginfo(f"[GUI] Subscribed to {topic}")
 
-
     def _capture_reset_photo(self):
         frame = self.img_buffer.get()
         if frame is None:
@@ -339,21 +278,15 @@ class CaptureWindow(QtWidgets.QWidget):
             self.countdownLbl.setText("No image available! (RESET)")
             return None
 
-        # Guardar a disco (igual que hacía _save_and_show, pero sin mostrar)
         ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         fn = self.save_tmp_dir / (f"reset_{ts}.png")
         cv2.imwrite(str(fn), frame)
         self.reset_path = fn
 
-        # Mostrar la imagen en el primer hueco usando la función nueva (sin overlay)
         self._annotate_image_with_plan(str(self.reset_path), {})
         return self.reset_path
 
     def _call_plan_action(self, image_path: str, prompt: str):
-        """
-        Llama a /vlm/plan_action y devuelve (raw_plan_json_str, plan_dict).
-        plan_dict esperado: {"cubes":[{"color":..., "x":..., "y":...},...], "order":[...]}
-        """
         if not HAS_PLAN_ACTION:
             rospy.logwarn("[GUI] PlanAction srv not imported. Skipping call.")
             return "", {}
@@ -380,11 +313,6 @@ class CaptureWindow(QtWidgets.QWidget):
         return raw, plan
 
     def _generate_pseudo_targets(self, plan_dict: dict, img_path: str):
-        """
-        Genera objetivos pseudoaleatorios deterministas por color dentro del tamaño de la imagen.
-        Seed basada en session_id para reproducibilidad.
-        Devuelve dict: {"targets":{"red":{"x":..,"y":..}, ...}, "width":W, "height":H}
-        """
         import cv2, random
         if not plan_dict or "cubes" not in plan_dict:
             return {}
@@ -394,11 +322,8 @@ class CaptureWindow(QtWidgets.QWidget):
             return {}
         h, w = img.shape[:2]
 
-        # Seed determinista con session_id
         seed = (self.session_id or "seed") + "_reset"
         rnd = random.Random(seed)
-
-        # Margen para no caer en los bordes
         margin = int(0.08 * min(w, h))
         targets = {}
         for item in plan_dict.get("cubes", []):
@@ -409,10 +334,7 @@ class CaptureWindow(QtWidgets.QWidget):
 
         return {"targets": targets, "width": w, "height": h}
 
-    
     def _show_qimage_from_cv(self, cv_img, target_label):
-        #import cv2
-        #from PyQt5 import QtGui, QtCore
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         qimg = QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
@@ -427,15 +349,9 @@ class CaptureWindow(QtWidgets.QWidget):
             return None, None
         x = max(0, min(w - 1, x))
         y = max(0, min(h - 1, y))
-        return y, x  # devuelve (y_px, x_px)
+        return y, x
 
     def _evenly_spaced_targets(self, order, w, h, y_line=None, margin_ratio=0.08):
-        """
-        Genera targets equiespaciados sobre una línea horizontal:
-        - order: lista de colores en orden izquierda→derecha
-        - y_line: si es None, usa ~60% de la altura
-        """
-        import math
         n = max(1, len(order))
         margin = int(round(margin_ratio * w))
         usable_w = max(1, w - 2 * margin)
@@ -450,19 +366,13 @@ class CaptureWindow(QtWidgets.QWidget):
         return targets
 
     def _fix_or_generate_targets(self, cubes, targets, order, w, h, min_dist_px=40):
-        """
-        Si targets falta o alguno está muy cerca de su cube del mismo color,
-        recalcula targets equiespaciados en una línea horizontal.
-        """
         import math
         if not order:
             order = [c["color"] for c in cubes]
 
-        # Si no hay targets o no cubren todos los colores del orden → generar
         if not targets or any(normalize_color(c) not in targets for c in order):
             return self._evenly_spaced_targets(order, w, h)
 
-        # Comprueba distancia cube↔target color a color
         need_fix = False
         cube_by_color = {normalize_color(c["color"]): (int(c["x"]), int(c["y"])) for c in cubes}
         for c in order:
@@ -479,211 +389,255 @@ class CaptureWindow(QtWidgets.QWidget):
             return self._evenly_spaced_targets(order, w, h)
         return targets
 
-
     def _annotate_image_with_plan(self, img_path: str, plan_dict: dict):
-        rospy.loginfo("He entrado a la funcion de anotar imagen")
-        """
-        Si plan_dict está vacío -> muestra la imagen tal cual.
-        Si tiene datos -> dibuja:
-        - cubes: plan_dict['cubes'] = [{color,x,y}, ...]
-        - targets: plan_dict['targets'] = {color: {x,y}, ...}
-        - líneas cube->target por color
-        Siempre re-muestra en self.firstImgLbl (NO usa _save_and_show).
-        """
-        #import cv2
         if not img_path:
             return
-
         img = cv2.imread(img_path)
         if img is None:
             return
 
-        # Si no hay plan -> solo mostrar
         if not plan_dict:
-            rospy.loginfo("He entrado al if de cuando no hay plan")
-            #rospy.loginfo(img)
             self._show_qimage_from_cv(img, self.firstImgLbl)
             self.countdownLbl.setText("Waiting response...")
             self.firstImgLbl.setToolTip("RESET photo")
             QtWidgets.QApplication.processEvents()
-            
-            
             return
 
         h, w = img.shape[:2]
-
-        # ----- Con anotaciones -----
-        # ---------- CUBES ----------
+        
+        # Cubes
         cubes = []
-        cubes_raw = plan_dict.get("cubes", []) or []
-        for item in cubes_raw:
+        for item in plan_dict.get("cubes", []):
             color_name = normalize_color(str(item.get("color", "")))
-            # Esperamos 'yx': [y_norm, x_norm] en 0..1000
             yx = item.get("yx", None)
-
-            # Fallbacks de robustez si el modelo a veces manda otras claves:
-            if yx is None and "coords" in item and isinstance(item["coords"], (list, tuple)) and len(item["coords"]) >= 2:
-                yx = [item["coords"][0], item["coords"][1]]
             if yx is None and "y" in item and "x" in item:
-                # si manda y/x normalizados por separado
                 yx = [item["y"], item["x"]]
-
             if not isinstance(yx, (list, tuple)) or len(yx) < 2:
                 continue
-
             y_px, x_px = self._denorm_yx1000_to_px(yx[0], yx[1], w, h)
-            if y_px is None or x_px is None:
-                continue
-            cubes.append({"color": color_name, "x": x_px, "y": y_px})
+            if y_px is not None:
+                cubes.append({"color": color_name, "x": x_px, "y": y_px})
 
-        # ---------- TARGETS ----------
+        # Targets
         targets = {}
-        targets_raw = plan_dict.get("targets", {}) or {}
-        if isinstance(targets_raw, dict):
-            it = targets_raw.items()
-        else:
-            # por si alguna vez viene como lista [{color, yx:[..]}]
-            it = [(it.get("color",""), it) for it in (targets_raw or [])]
-
+        targets_raw = plan_dict.get("targets", {})
+        # Unificar formato si viene como dict o lista
+        it = targets_raw.items() if isinstance(targets_raw, dict) else [(x.get("color",""), x) for x in (targets_raw or [])]
+        
         for cname, pos in it:
             c = normalize_color(str(cname))
-            if not isinstance(pos, dict):
-                continue
             yx = pos.get("yx", None)
-            if yx is None and "coords" in pos and isinstance(pos["coords"], (list, tuple)) and len(pos["coords"]) >= 2:
-                yx = [pos["coords"][0], pos["coords"][1]]
             if yx is None and "y" in pos and "x" in pos:
                 yx = [pos["y"], pos["x"]]
-
             if not isinstance(yx, (list, tuple)) or len(yx) < 2:
                 continue
-
             y_px, x_px = self._denorm_yx1000_to_px(yx[0], yx[1], w, h)
-            if y_px is None or x_px is None:
-                continue
-            targets[c] = {"x": x_px, "y": y_px}
+            if y_px is not None:
+                targets[c] = {"x": x_px, "y": y_px}
 
-        # Asegura que los targets no coinciden con los cubes (o genera equiespaciados si faltan)
-        targets = self._fix_or_generate_targets(cubes, targets, plan_dict.get("order", []), w, h, min_dist_px=40)
+        # Ajustar targets
+        targets = self._fix_or_generate_targets(cubes, targets, plan_dict.get("order", []), w, h)
 
-
-        # Dibuja cubes
+        # Dibujar
         for item in cubes:
-            color_name = normalize_color(str(item.get("color", "")))
-            x = int(item.get("x", -1))
-            y = int(item.get("y", -1))
-            if x < 0 or y < 0:
-                continue
-            bgr = COLOR_TO_BGR.get(color_name, (0, 255, 255))  # default: amarillo
-            cv2.circle(img, (x, y), 8, bgr, thickness=-1, lineType=cv2.LINE_AA)
-            cv2.circle(img, (x, y), 10, (0, 0, 0), thickness=2, lineType=cv2.LINE_AA)
-            cv2.putText(img, f"{color_name}", (x + 12, y - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
+            x, y = int(item["x"]), int(item["y"])
+            color_name = item["color"]
+            bgr = COLOR_TO_BGR.get(color_name, (0, 255, 255))
+            cv2.circle(img, (x, y), 8, bgr, -1, cv2.LINE_AA)
+            cv2.circle(img, (x, y), 10, (0,0,0), 2, cv2.LINE_AA)
+            cv2.putText(img, color_name, (x+12, y-12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
 
-        # Dibuja targets
-        for color_name, pos in targets.items():
-            c = normalize_color(str(color_name))
-            tx = int(pos.get("x", -1))
-            ty = int(pos.get("y", -1))
-            if tx < 0 or ty < 0:
-                continue
-            bgr = COLOR_TO_BGR.get(c, (255, 255, 255))  # default: blanco
-            marker_type = getattr(cv2, "MARKER_TILTED_CROSS", getattr(cv2, "MARKER_CROSS", 0))
-            cv2.drawMarker(img, (tx, ty), bgr, markerType=marker_type,
-                        markerSize=20, thickness=2, line_type=cv2.LINE_AA)
-            cv2.circle(img, (tx, ty), 10, bgr, thickness=2, lineType=cv2.LINE_AA)
-            cv2.putText(img, f"target:{c}", (tx + 12, ty + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
+        for c, pos in targets.items():
+            tx, ty = int(pos["x"]), int(pos["y"])
+            bgr = COLOR_TO_BGR.get(c, (255, 255, 255))
+            cv2.drawMarker(img, (tx, ty), bgr, cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
+            cv2.putText(img, f"target:{c}", (tx+12, ty+18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
 
-        # Líneas cube->target por color
-        target_points = {normalize_color(k): (int(v.get("x", -1)), int(v.get("y", -1)))
-                        for k, v in targets.items()
-                        if int(v.get("x", -1)) >= 0 and int(v.get("y", -1)) >= 0}
-
+        # Lineas
+        target_points = {c: (int(p["x"]), int(p["y"])) for c, p in targets.items()}
         for item in cubes:
-            c = normalize_color(str(item.get("color", "")))
-            sx, sy = int(item.get("x", -1)), int(item.get("y", -1))
-            if c in target_points and sx >= 0 and sy >= 0:
+            c = item["color"]
+            sx, sy = int(item["x"]), int(item["y"])
+            if c in target_points:
                 tx, ty = target_points[c]
                 bgr = COLOR_TO_BGR.get(c, (200, 200, 200))
-                cv2.line(img, (sx, sy), (tx, ty), bgr, thickness=2, lineType=cv2.LINE_AA)
+                cv2.line(img, (sx, sy), (tx, ty), bgr, 2, cv2.LINE_AA)
 
-        # Leyenda
-        #cv2.rectangle(img, (10, 10), (360, 80), (0, 0, 0), thickness=-1)
-        #cv2.putText(img, "● cube(center)   x target(center)   line: move-to",
-        #            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-
-        # Mostrar en primer hueco (sin _save_and_show)
         self._show_qimage_from_cv(img, self.secondImgLbl)
         self.secondImgLbl.setToolTip("RESET photo with plan overlay")
         self.countdownLbl.setText("Plan Ready!")
 
-
+    # =========================================================================
+    # ACCIONES DE BOTONES (Slots)
+    # =========================================================================
 
     def on_reset_clicked(self):
-        # Asegura subscripción activa
-        #self.start_sub()
-
-        # Toma foto
         path = self._capture_reset_photo()
         if not path:
             self.planOut.setPlainText("ERROR: no image captured for reset.")
             return
 
-        # Prompt (puedes permitir editarlo si quieres; por ahora fijo)
-        plan_prompt = DEFAULT_PLAN_PROMPT
-
-        # Llama al LLM
+        # Llamada al Planificador (VLM)
         try:
-            raw, plan = self._call_plan_action(str(path), plan_prompt)
+            raw, plan = self._call_plan_action(str(path), DEFAULT_PLAN_PROMPT)
         except Exception as e:
             self.planOut.setPlainText(f"ERROR calling plan_action: {e}")
             return
 
-        # Genera objetivos pseudoaleatorios deterministas
+        # Generar targets si no vinieron
         targets_info = self._generate_pseudo_targets(plan, str(path))
-
-        # Adjunta 'targets' si no viniera desde el LLM
-        if plan is None:
-            plan = {}
+        if plan is None: plan = {}
         if "targets" not in plan and targets_info:
             plan["targets"] = targets_info.get("targets", {})
-            plan["_image_size"] = {"width": targets_info.get("width", 0),
-                                "height": targets_info.get("height", 0)}
-            plan["_note"] = "targets generated client-side (pseudo-random deterministic by session_id)"
+            plan["_image_size"] = {"width": targets_info.get("width",0), "height": targets_info.get("height",0)}
 
-        # Muestra JSON bonito
+        # 1. GUARDAR PLAN Y ACTIVAR EJECUCIÓN
+        self.current_plan = plan
+        self.btnExecute.setEnabled(True)
+        self.countdownLbl.setText("Plan Ready. Press EXECUTE to move robot.")
+
+        # Visualizar
         try:
             self.planOut.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
         except Exception:
             self.planOut.setPlainText(str(plan))
-        # Dibuja overlay con cubes/targets sobre la foto RESET
+        
         try:
             self._annotate_image_with_plan(str(self.reset_path), plan)
         except Exception as e:
             rospy.logwarn(f"[GUI] overlay error: {e}")
 
+    def on_execute_clicked(self):
+        """Recorre el plan, transforma coordenadas y manda al robot."""
+        if not HAS_ROBOT_MODULES:
+            self.resultLbl.setText("ERROR: Mensajes del robot no disponibles.")
+            return
+        if not self.current_plan:
+            return
 
+        # Inicializar Clientes (Lazy Loading)
+        if self.ac_pickup is None:
+            self.ac_pickup = actionlib.SimpleActionClient('/vlm/pickup', PickUpAction)
+            rospy.loginfo("Esperando servidor de Acción PickUp...")
+            # self.ac_pickup.wait_for_server(rospy.Duration(2.0)) # Opcional timeout
 
+        if self.srv_transform is None:
+            rospy.wait_for_service('/vlm/transform_pose')
+            self.srv_transform = rospy.ServiceProxy('/vlm/transform_pose', TransformPose)
 
-    # ----- Helpers de imagen -----
-    def _save_and_show(self, cv_img, which="first"):
-        import cv2
-        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        fn = self.save_tmp_dir / (f"{which}_{ts}.png")
-        cv2.imwrite(str(fn), cv_img)
-        # Mostrar
-        rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, _ = rgb.shape
-        qimg = QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
-        pix  = QtGui.QPixmap.fromImage(qimg)
-        target = self.firstImgLbl if which == "first" else self.secondImgLbl
-        target.setPixmap(pix.scaled(target.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-        return fn
+        # 2. Extraer datos del plan
+        cubes_list = self.current_plan.get("cubes", [])
+        targets_dict = self.current_plan.get("targets", {})
+        order_list = self.current_plan.get("order", [])
+        
+        # Mapa rápido para buscar cubos por color
+        cubes_map = {normalize_color(c.get("color","")): c for c in cubes_list}
 
-    # ----- Flujo -----
+        # Dimensiones para des-normalizar
+        img_w = 640
+        img_h = 480
+        if "_image_size" in self.current_plan:
+            img_w = self.current_plan["_image_size"].get("width", 640)
+            img_h = self.current_plan["_image_size"].get("height", 480)
+
+        self.resultLbl.setText("Executing Sequence (R -> L)...")
+        QtWidgets.QApplication.processEvents()
+
+        # --- MODIFICACIÓN: Ordenar de Derecha (Mayor X) a Izquierda (Menor X) ---
+        def get_x_coord(color_name):
+            c_norm = normalize_color(color_name)
+            if c_norm not in cubes_map: return -1
+            # yx -> [y, x]. Queremos el índice 1 (x)
+            cube_data = cubes_map[c_norm]
+            if "yx" in cube_data:
+                return cube_data["yx"][1] # Formato VLM 0-1000
+            elif "x" in cube_data:
+                return cube_data["x"]     # Formato pseudo (pixels)
+            return -1
+
+        # Orden descendente (reverse=True)
+        sorted_order_list = sorted(order_list, key=get_x_coord, reverse=True)
+        rospy.loginfo(f"Execution Order (Right->Left): {sorted_order_list}")
+
+        # 3. Ejecutar Secuencia
+        for color_raw in sorted_order_list:
+            color = normalize_color(color_raw)
+            
+            if color not in cubes_map or color not in targets_dict:
+                rospy.logwarn(f"Skipping {color}: data missing in plan.")
+                continue
+
+            # --- A. OBTENER PIXELES (PICK) ---
+            cube_data = cubes_map[color]
+            cy_norm, cx_norm = cube_data.get("yx", [0,0])
+            py_px, px_px = self._denorm_yx1000_to_px(cy_norm, cx_norm, img_w, img_h)
+            
+            # --- B. OBTENER PIXELES (PLACE) ---
+            target_data = targets_dict[color]
+            if "yx" in target_data:
+                ty_norm, tx_norm = target_data["yx"]
+                ly_px, lx_px = self._denorm_yx1000_to_px(ty_norm, tx_norm, img_w, img_h)
+            else:
+                lx_px = target_data.get("x")
+                ly_px = target_data.get("y")
+
+            rospy.loginfo(f"Procesando {color}: PickPx({px_px},{py_px}) -> PlacePx({lx_px},{ly_px})")
+
+            # --- C. LLAMAR AL SERVICIO DE TRANSFORMACIÓN (Pixels -> Meters) ---
+            try:
+                # Transformar PICK
+                res_pick = self.srv_transform(cam_x=float(px_px), cam_y=float(py_px), cam_z=1.0) 
+                if not res_pick.success: raise Exception("Transform Pick Failed")
+                
+                # Transformar PLACE
+                res_place = self.srv_transform(cam_x=float(lx_px), cam_y=float(ly_px), cam_z=1.0)
+                if not res_place.success: raise Exception("Transform Place Failed")
+
+            except Exception as e:
+                rospy.logerr(f"Error transformando coordenadas para {color}: {e}")
+                continue
+
+            # --- D. ENVIAR ACCIÓN AL ROBOT ---
+            goal = PickUpGoal()
+            goal.pick_x = res_pick.base_x
+            goal.pick_y = res_pick.base_y
+            #goal.pick_z = res_pick.base_z
+            goal.pick_z = 0.67
+            #goal.place_x = res_place.base_x
+            goal.place_x = -0.30
+            #goal.place_y = res_place.base_y
+            goal.place_y = 0.50
+            goal.place_z = res_place.base_z
+            goal.place_z = 0.67
+            goal.use_cube_mode = True
+            #goal.torso_height = 0.30
+            
+            # Opciones
+            goal.use_cube_mode = True # Es un cubo, ignoramos Yaw
+            # goal.torso_height = 0.30 # ELIMINADO (según tu petición)
+
+            rospy.loginfo(f"Enviando Acción para {color}...")
+            self.ac_pickup.send_goal(goal, feedback_cb=self._robot_feedback_cb)
+            
+            # Esperar a que termine este movimiento antes del siguiente
+            while not self.ac_pickup.wait_for_result(rospy.Duration(0.1)):
+                QtWidgets.QApplication.processEvents() # Mantiene la GUI viva
+            
+            result = self.ac_pickup.get_result()
+            if not result.success:
+                self.resultLbl.setText(f"Error moving {color}: {result.message}")
+                # Opcional: return para parar todo, o continue para intentar el siguiente
+                continue
+
+        self.resultLbl.setText("Sequence Completed Successfully!")
+        self.countdownLbl.setText("Robot Done.")
+
+    def _robot_feedback_cb(self, feedback):
+        # Actualizar la GUI con lo que está haciendo el robot
+        self.resultLbl.setText(f"Robot: {feedback.current_state}")
+
+    # ----- Flujo Auditoría -----
     def on_start_clicked(self):
-        #self.start_sub()
         self.session_id = new_session_id()
         self.session_started_at = datetime.datetime.utcnow()
         self.first_done = False
@@ -722,7 +676,6 @@ class CaptureWindow(QtWidgets.QWidget):
                 self.second_done = True
                 self.timer_ui.stop()
                 self.countdownLbl.setText("Second photo taken. Analyzing…")
-                # Continua pipeline: llamar a Gemini y luego a FinalizeSession
                 QtCore.QTimer.singleShot(100, self._after_second_photo)
 
     def _capture_first(self):
@@ -740,34 +693,40 @@ class CaptureWindow(QtWidgets.QWidget):
             self.countdownLbl.setText("No image available! (SECOND)")
             return
         self.second_path = self._save_and_show(frame, "second")
+    
+    # ----- Helpers de imagen -----
+    def _save_and_show(self, cv_img, which="first"):
+        import cv2
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        fn = self.save_tmp_dir / (f"{which}_{ts}.png")
+        cv2.imwrite(str(fn), cv_img)
+        # Mostrar
+        rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        h, w, _ = rgb.shape
+        qimg = QtGui.QImage(rgb.data, w, h, 3*w, QtGui.QImage.Format_RGB888)
+        pix  = QtGui.QPixmap.fromImage(qimg)
+        target = self.firstImgLbl if which == "first" else self.secondImgLbl
+        target.setPixmap(pix.scaled(target.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        return fn
 
-    # ----- Integración con servicios -----
     def _call_gemini(self, image1_path: str, image2_path: str, prompt: str):
-        """Llama al servicio /gemini_vision/analyze_images y devuelve (raw_answer, pred_order, pred_is_correct, latency_ms)."""
         if not HAS_GEMINI:
-            rospy.logwarn("[GUI] Servicio GeminiAnalyze no disponible en tiempo de import. Me salto la llamada.")
             return "", [], None, 0
-
         try:
             rospy.wait_for_service("/gemini_vision/analyze_images", timeout=10.0)
-        except Exception as e:
-            rospy.logwarn(f"[GUI] Gemini service not available: {e}")
+        except Exception:
             return "", [], None, 0
-
         proxy = rospy.ServiceProxy("/gemini_vision/analyze_images", GeminiAnalyze)
         req = GeminiAnalyzeRequest(image1_path=image1_path, image2_path=image2_path, prompt=prompt)
         t0 = time.time()
         resp = proxy(req)
         t1 = time.time()
         latency_ms = int((t1 - t0) * 1000)
-
         raw = getattr(resp, "answer", "") if hasattr(resp, "answer") else ""
-        # parsea
         pred_order, pred_is_correct = parse_predicted_order(raw)
         return raw, pred_order, pred_is_correct, latency_ms
 
     def _call_finalize_session(self, **kwargs):
-        """Llama al servicio /vlm/finalize_session y devuelve (session_dir, manifest_dict, summary_string)."""
         rospy.wait_for_service("/vlm/finalize_session", timeout=10.0)
         proxy = rospy.ServiceProxy("/vlm/finalize_session", FinalizeSession)
         req = FinalizeSessionRequest()
@@ -793,28 +752,16 @@ class CaptureWindow(QtWidgets.QWidget):
             raise RuntimeError("FinalizeSession error: " + resp.error)
 
         manifest = json.loads(resp.manifest_json) if resp.manifest_json else {}
-        # resumen rápido para pantalla
         try:
             acc = manifest["metrics"].get("per_position_acc", 0.0)
-            ham = manifest["metrics"].get("hamming", 0)
             cfl = manifest["metrics"].get("correct_flag", False)
             odr = manifest["vlm"]["predicted"].get("colors_order",[])
-            if isinstance(odr, str):
-                try:
-                    odr = json.loads(odr)
-                except Exception:
-                    odr = [odr]
-    
-            # convertir la lista a string legible
-            odr_str = ", ".join(map(str, odr))
-            summary = f"Saved: {resp.session_dir} | Order match: {acc*100:.0f}% | Order Predicted: {odr} | Is Correct?: {cfl}"
-        except Exception as e:
-            rospy.logwarn(e)
+            summary = f"Saved: {resp.session_dir} | Match: {acc*100:.0f}% | Correct?: {cfl}"
+        except Exception:
             summary = f"Saved: {resp.session_dir}"
         return resp.session_dir, manifest, summary
 
     def _after_second_photo(self):
-        # 1) Llamar a Gemini
         prompt = self.promptEdit.toPlainText().strip()
         prompt=prompt.replace("[GT]",self.gtEdit.text().strip())
         raw_answer, pred_order, pred_is_correct, latency_ms = self._call_gemini(
@@ -827,7 +774,6 @@ class CaptureWindow(QtWidgets.QWidget):
         self.pred_is_correct = pred_is_correct if pred_is_correct is not None else False
         self.vlm_latency_ms = latency_ms
 
-        # 2) Llamar a FinalizeSession
         gt_list = [c.strip() for c in self.gtEdit.text().split(",") if c.strip()]
         ended_at = datetime.datetime.utcnow()
         try:
@@ -846,7 +792,7 @@ class CaptureWindow(QtWidgets.QWidget):
                 vlm_model="gemini-robotics-er-1.5-preview",
                 vlm_raw_answer=self.vlm_raw_answer,
                 vlm_latency_ms=self.vlm_latency_ms,
-                output_base_dir="",   # vacío -> ~/.ros/rehab_sessions
+                output_base_dir="", 
                 move_files=True
             )
             self.resultLbl.setText(summary)
@@ -868,7 +814,6 @@ def main():
     w = CaptureWindow()
     w.show()
 
-    # Timer "no-op" para integrar Qt con ROS y permitir Ctrl+C
     t = QtCore.QTimer()
     t.timeout.connect(lambda: None)
     t.start(50)
