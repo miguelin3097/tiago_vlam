@@ -145,6 +145,18 @@ COLOR_TO_BGR = {
     "gray":   (128, 128, 128),
 }
 
+# --- AÑADIR ESTO AL PRINCIPIO (Configuración) ---
+
+# Lista de destinos fijos (en metros, respecto a base_footprint)
+# El robot irá rellenando estos huecos en orden.
+# Formato: (x, y, z)
+FIXED_TARGETS_METERS = [
+    (0.30,  -0.30, 0.67),  # Hueco 1 (Izquierda)
+    (0.30,  -0.30, 0.67),  # Hueco 2 (Centro)
+    (0.30,  -0.30, 0.67),  # Hueco 3 (Derecha)
+    (0.30,  -0.30, 0.67)  # Hueco 4 (Fila de atrás...)
+]
+
 def iso_utc(dt: datetime.datetime):
     return dt.replace(microsecond=0).isoformat() + "Z"
 
@@ -563,7 +575,7 @@ class CaptureWindow(QtWidgets.QWidget):
         for color_raw in sorted_order_list:
             color = normalize_color(color_raw)
             
-            if color not in cubes_map or color not in targets_dict:
+            if color not in cubes_map:
                 rospy.logwarn(f"Skipping {color}: data missing in plan.")
                 continue
 
@@ -571,44 +583,36 @@ class CaptureWindow(QtWidgets.QWidget):
             cube_data = cubes_map[color]
             cy_norm, cx_norm = cube_data.get("yx", [0,0])
             py_px, px_px = self._denorm_yx1000_to_px(cy_norm, cx_norm, img_w, img_h)
-            
-            # --- B. OBTENER PIXELES (PLACE) ---
-            target_data = targets_dict[color]
-            if "yx" in target_data:
-                ty_norm, tx_norm = target_data["yx"]
-                ly_px, lx_px = self._denorm_yx1000_to_px(ty_norm, tx_norm, img_w, img_h)
-            else:
-                lx_px = target_data.get("x")
-                ly_px = target_data.get("y")
 
-            rospy.loginfo(f"Procesando {color}: PickPx({px_px},{py_px}) -> PlacePx({lx_px},{ly_px})")
+            #rospy.loginfo(f"Procesando {color}: PickPx({px_px},{py_px}) -> PlacePx({lx_px},{ly_px})")
 
             # --- C. LLAMAR AL SERVICIO DE TRANSFORMACIÓN (Pixels -> Meters) ---
             try:
                 # Transformar PICK
-                res_pick = self.srv_transform(cam_x=float(px_px), cam_y=float(py_px), cam_z=1.0) 
+                res_pick = self.srv_transform(cam_x=float(px_px), cam_y=float(py_px), cam_z_depth=1.0) 
                 if not res_pick.success: raise Exception("Transform Pick Failed")
                 
                 # Transformar PLACE
-                res_place = self.srv_transform(cam_x=float(lx_px), cam_y=float(ly_px), cam_z=1.0)
-                if not res_place.success: raise Exception("Transform Place Failed")
-
             except Exception as e:
                 rospy.logerr(f"Error transformando coordenadas para {color}: {e}")
                 continue
+            # --- B. PLACE (Destino): Viene de la LISTA FIJA ---
+            # Cogemos la coordenada i de nuestra lista hardcodeada
+            tgt_x, tgt_y, tgt_z = FIXED_TARGETS_METERS[0]
 
+            rospy.loginfo(f"Moving {color}: Vision({res_pick.base_x:.2f}, {res_pick.base_y:.2f}) -> Fixed({tgt_x}, {tgt_y})")
             # --- D. ENVIAR ACCIÓN AL ROBOT ---
             goal = PickUpGoal()
             goal.pick_x = res_pick.base_x
             goal.pick_y = res_pick.base_y
             #goal.pick_z = res_pick.base_z
             goal.pick_z = 0.67
-            #goal.place_x = res_place.base_x
-            goal.place_x = -0.30
-            #goal.place_y = res_place.base_y
-            goal.place_y = 0.50
-            goal.place_z = res_place.base_z
-            goal.place_z = 0.67
+            goal.place_x = tgt_x
+            #goal.place_x = -0.30
+            goal.place_y = tgt_y
+            #goal.place_y = 0.50
+            goal.place_z = tgt_z
+            #goal.place_z = 0.50
             goal.use_cube_mode = True
             #goal.torso_height = 0.30
             

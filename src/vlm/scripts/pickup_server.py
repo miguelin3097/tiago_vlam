@@ -19,7 +19,7 @@ READY_JOINTS = [0.629, 0.009, 1.637, 1.168, 1.093, -1.339, -1.506]
 # (Opcional) Puedes descomentar esto si quieres tu pose de REST
 # REST_JOINTS  = [-1.080, 1.480, 2.872, 1.584, -1.599, 1.358, -0.005]
 
-DEFAULT_ROT = {'r': 0.0, 'p': 90.0, 'y': 0.0} # Top-Down para cubos
+DEFAULT_ROT = {'r': 90.0, 'p': 30.0, 'y': 90.0} # Top-Down para cubos
 
 # --- CLASE WORKER ---
 class WorkerThread(QtCore.QThread):
@@ -50,7 +50,7 @@ class RobotController(QtCore.QObject):
         self.gripper_group = moveit_commander.MoveGroupCommander("gripper_right")
         # SIN TORSO
         
-        self.arm_group.set_planning_time(2.0)
+        self.arm_group.set_planning_time(10.0)
         self.arm_group.set_num_planning_attempts(5)
         self.arm_group.set_goal_position_tolerance(0.005)
         self.arm_group.set_goal_orientation_tolerance(0.05)
@@ -91,6 +91,7 @@ class RobotController(QtCore.QObject):
         pose.pose.position.x = x
         pose.pose.position.y = y
         pose.pose.position.z = z
+        self._feedback(f"Moving to {x}, {y}, {z}")
         q = quaternion_from_euler(math.radians(r), math.radians(p), math.radians(yaw))
         pose.pose.orientation.x = q[0]
         pose.pose.orientation.y = q[1]
@@ -190,8 +191,8 @@ class RobotController(QtCore.QObject):
             self._move_gripper("open")
 
             # 2. Pick
-            r, p, yaw = DEFAULT_ROT['r'], DEFAULT_ROT['p'], 0.0
-            auto = goal.use_cube_mode
+            r, p, yaw = DEFAULT_ROT['r'], DEFAULT_ROT['p'], DEFAULT_ROT['y']
+            auto = False
             
             self._feedback("Picking...")
             # Aprox (+15cm)
