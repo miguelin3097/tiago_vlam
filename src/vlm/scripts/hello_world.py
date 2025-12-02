@@ -150,6 +150,7 @@ COLOR_TO_BGR = {
 # Lista de destinos fijos (en metros, respecto a base_footprint)
 # El robot irá rellenando estos huecos en orden.
 # Formato: (x, y, z)
+# Posicion segun color del cubo
 FIXED_TARGETS_METERS = {
     "red": (0.45,  -0.37, 0.66),  # Hueco 1 (Izquierda)
     "blue": (0.58,  -0.42, 0.66),  # Hueco 2 (Centro)
