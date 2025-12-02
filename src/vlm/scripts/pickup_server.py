@@ -140,7 +140,7 @@ class RobotController(QtCore.QObject):
 
     def _move_gripper(self, state):
         if self.check_stop(): return False
-        vals = [0.044, 0.044] if state == "open" else [0.005, 0.005]
+        vals = [0.044, 0.044] if state == "open" else [0.011, 0.011]
         self.gripper_group.set_joint_value_target(vals)
         return self.gripper_group.go(wait=True)
 

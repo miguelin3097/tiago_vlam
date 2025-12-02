@@ -150,12 +150,12 @@ COLOR_TO_BGR = {
 # Lista de destinos fijos (en metros, respecto a base_footprint)
 # El robot irá rellenando estos huecos en orden.
 # Formato: (x, y, z)
-FIXED_TARGETS_METERS = [
-    (0.30,  -0.30, 0.67),  # Hueco 1 (Izquierda)
-    (0.30,  -0.30, 0.67),  # Hueco 2 (Centro)
-    (0.30,  -0.30, 0.67),  # Hueco 3 (Derecha)
-    (0.30,  -0.30, 0.67)  # Hueco 4 (Fila de atrás...)
-]
+FIXED_TARGETS_METERS = {
+    "red": (0.45,  -0.37, 0.66),  # Hueco 1 (Izquierda)
+    "blue": (0.58,  -0.42, 0.66),  # Hueco 2 (Centro)
+    "yellow": (0.64,  -0.14, 0.66),  # Hueco 3 (Derecha)
+    "green": (0.41,  -0.17, 0.66)  # Hueco 4 (Fila de atrás...)
+}
 
 def iso_utc(dt: datetime.datetime):
     return dt.replace(microsecond=0).isoformat() + "Z"
@@ -598,7 +598,7 @@ class CaptureWindow(QtWidgets.QWidget):
                 continue
             # --- B. PLACE (Destino): Viene de la LISTA FIJA ---
             # Cogemos la coordenada i de nuestra lista hardcodeada
-            tgt_x, tgt_y, tgt_z = FIXED_TARGETS_METERS[0]
+            tgt_x, tgt_y, tgt_z = FIXED_TARGETS_METERS[color]
 
             rospy.loginfo(f"Moving {color}: Vision({res_pick.base_x:.2f}, {res_pick.base_y:.2f}) -> Fixed({tgt_x}, {tgt_y})")
             # --- D. ENVIAR ACCIÓN AL ROBOT ---
@@ -606,18 +606,18 @@ class CaptureWindow(QtWidgets.QWidget):
             goal.pick_x = res_pick.base_x
             goal.pick_y = res_pick.base_y
             #goal.pick_z = res_pick.base_z
-            goal.pick_z = 0.67
+            goal.pick_z = 0.65
             goal.place_x = tgt_x
             #goal.place_x = -0.30
             goal.place_y = tgt_y
             #goal.place_y = 0.50
             goal.place_z = tgt_z
             #goal.place_z = 0.50
-            goal.use_cube_mode = True
+            goal.use_cube_mode = False
             #goal.torso_height = 0.30
             
             # Opciones
-            goal.use_cube_mode = True # Es un cubo, ignoramos Yaw
+            goal.use_cube_mode = False # Es un cubo, ignoramos Yaw
             # goal.torso_height = 0.30 # ELIMINADO (según tu petición)
 
             rospy.loginfo(f"Enviando Acción para {color}...")
