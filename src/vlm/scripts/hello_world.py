@@ -9,6 +9,7 @@ import datetime
 import threading
 from pathlib import Path
 import cv2
+import math
 
 import rospy
 import actionlib  # <--- NUEVO: Necesario para ActionClient
@@ -158,6 +159,7 @@ FIXED_TARGETS_METERS = {
     "green": (0.41,  -0.17, 0.66)  # Hueco 4 (Fila de atrás...)
 }
 
+
 def iso_utc(dt: datetime.datetime):
     return dt.replace(microsecond=0).isoformat() + "Z"
 
@@ -183,6 +185,13 @@ class CaptureWindow(QtWidgets.QWidget):
         self.btnExecute = QtWidgets.QPushButton("EXECUTE ON ROBOT (Right->Left)")
         self.btnExecute.setStyleSheet("background-color: #FF9800; font-weight: bold; color: white;")
         self.btnExecute.setEnabled(False) # Se activa solo tras Reset
+
+        self.btnSetTargets = QtWidgets.QPushButton("SET Current as Targets")
+        #self.btnSetTargets.setMinimumHeight(50)
+        #self.btnSetTargets.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        
+
+        
         
         self.planOut = QtWidgets.QPlainTextEdit()
         self.planOut.setReadOnly(True)
@@ -204,6 +213,8 @@ class CaptureWindow(QtWidgets.QWidget):
         self.resultLbl.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.resultLbl.setMinimumHeight(70)
 
+        
+
         # ---------- Layout ----------
         form = QtWidgets.QFormLayout()
         form.addRow("Image topic:", self.topicEdit)
@@ -214,6 +225,7 @@ class CaptureWindow(QtWidgets.QWidget):
         top.addLayout(form, 1)
         top.addWidget(self.btnStart, 0)
         top.addWidget(self.btnReset, 0)
+        top.addWidget(self.btnSetTargets)
         top.addWidget(self.btnExecute, 0) # Añadimos el botón al layout
 
         imgs = QtWidgets.QHBoxLayout()
@@ -263,6 +275,10 @@ class CaptureWindow(QtWidgets.QWidget):
 
         self.reset_path = None
         
+
+        self.saved_targets_visual = {}   # Guardará { "red": [y_norm, x_norm], ... }
+        self.saved_targets_physical = {} # Guardará { "red": (x_m, y_m, z_m), ... }
+        
         # --- Estado para el Robot ---
         self.current_plan = None
         self.ac_pickup = None      # Cliente Acción PickUp
@@ -272,6 +288,7 @@ class CaptureWindow(QtWidgets.QWidget):
         self.btnStart.clicked.connect(self.on_start_clicked)
         self.btnReset.clicked.connect(self.on_reset_clicked)
         self.btnExecute.clicked.connect(self.on_execute_clicked) # Conexión nueva
+        self.btnSetTargets.clicked.connect(self.on_set_targets_clicked)
 
         self.start_sub()
 
@@ -403,81 +420,141 @@ class CaptureWindow(QtWidgets.QWidget):
         return targets
 
     def _annotate_image_with_plan(self, img_path: str, plan_dict: dict):
+        """
+        Dibuja los cubos, los targets (aprendidos o fijos) y las flechas de movimiento.
+        Envía el resultado a la GUI y a la pantalla del robot.
+        """
         if not img_path:
             return
         img = cv2.imread(img_path)
         if img is None:
             return
 
+        # Si no hay plan, mostramos la imagen limpia esperando
         if not plan_dict:
             self._show_qimage_from_cv(img, self.firstImgLbl)
             self.countdownLbl.setText("Waiting response...")
             self.firstImgLbl.setToolTip("RESET photo")
+            # Enviar "Pensando" al robot si quieres, o nada
             QtWidgets.QApplication.processEvents()
             return
 
         h, w = img.shape[:2]
-        
-        # Cubes
+
+        DIST_THRESHOLD_PX = 40  # Umbral para considerar que el cubo está "en su sitio"
+
+        # -----------------------------------------------------------
+        # 1. OBTENER CUBOS DETECTADOS (SOURCE)
+        # -----------------------------------------------------------
         cubes = []
         for item in plan_dict.get("cubes", []):
             color_name = normalize_color(str(item.get("color", "")))
             yx = item.get("yx", None)
             if yx is None and "y" in item and "x" in item:
                 yx = [item["y"], item["x"]]
+            
             if not isinstance(yx, (list, tuple)) or len(yx) < 2:
                 continue
+            
+            # Convertir 0-1000 -> Píxeles
             y_px, x_px = self._denorm_yx1000_to_px(yx[0], yx[1], w, h)
             if y_px is not None:
                 cubes.append({"color": color_name, "x": x_px, "y": y_px})
 
-        # Targets
+        # Lista rápida de colores disponibles para filtrar targets
+        available_colors = {c["color"] for c in cubes}
+
+        # -----------------------------------------------------------
+        # 2. DETERMINAR TARGETS (DESTINATION)
+        # -----------------------------------------------------------
         targets = {}
-        targets_raw = plan_dict.get("targets", {})
-        # Unificar formato si viene como dict o lista
-        it = targets_raw.items() if isinstance(targets_raw, dict) else [(x.get("color",""), x) for x in (targets_raw or [])]
+
+        # LÓGICA DE PRIORIDAD:
+        # A. Si el usuario guardó targets con el botón "SET Targets", usamos esos.
+        # B. Si no, usamos los valores Hardcodeados por defecto.
         
-        for cname, pos in it:
-            c = normalize_color(str(cname))
-            yx = pos.get("yx", None)
-            if yx is None and "y" in pos and "x" in pos:
-                yx = [pos["y"], pos["x"]]
-            if not isinstance(yx, (list, tuple)) or len(yx) < 2:
-                continue
-            y_px, x_px = self._denorm_yx1000_to_px(yx[0], yx[1], w, h)
-            if y_px is not None:
-                targets[c] = {"x": x_px, "y": y_px}
+        if self.saved_targets_visual:
+            source_targets_config = self.saved_targets_visual
+        else:
+            # Defaults por si no has hecho "teaching" todavía
+            source_targets_config = {
+                "yellow": [480, 497], # [Y, X]
+                "green":  [790, 479],
+                "blue":   [580, 804],
+                "red":    [771, 771],
+                # Añade más defaults si quieres
+            }
 
-        # Ajustar targets
-        targets = self._fix_or_generate_targets(cubes, targets, plan_dict.get("order", []), w, h)
+        # Procesar y filtrar targets
+        for color, yx in source_targets_config.items():
+            # Solo creamos target si existe un cubo de ese color
+            if color in available_colors:
+                y_norm, x_norm = yx[0], yx[1]
+                y_px, x_px = self._denorm_yx1000_to_px(y_norm, x_norm, w, h)
+                
+                if y_px is not None and x_px is not None:
+                    targets[color] = {"x": x_px, "y": y_px}
 
-        # Dibujar
+        # -----------------------------------------------------------
+        # 3. DIBUJAR Y CALCULAR MOVIMIENTOS
+        # -----------------------------------------------------------
+        active_moves = [] # Guardaremos aquí las flechas que hay que pintar
+
+        # A) Dibujar Cubos y chequear distancias
         for item in cubes:
             x, y = int(item["x"]), int(item["y"])
-            color_name = item["color"]
-            bgr = COLOR_TO_BGR.get(color_name, (0, 255, 255))
+            c = item["color"]
+            bgr = COLOR_TO_BGR.get(c, (0, 255, 255))
+            
+            # Círculo del cubo
             cv2.circle(img, (x, y), 8, bgr, -1, cv2.LINE_AA)
             cv2.circle(img, (x, y), 10, (0,0,0), 2, cv2.LINE_AA)
-            cv2.putText(img, color_name, (x+12, y-12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
+            cv2.putText(img, c, (x+12, y-12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
 
+            # Verificar distancia al target (si tiene uno asignado)
+            if c in targets:
+                t_pos = targets[c]
+                tx, ty = int(t_pos["x"]), int(t_pos["y"])
+                
+                dist = math.hypot(tx - x, ty - y)
+                
+                if dist < DIST_THRESHOLD_PX:
+                    # YA ESTÁ EN SU SITIO -> Pintar "OK"
+                    cv2.putText(img, "OK", (x, y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                else:
+                    # NECESITA MOVERSE -> Guardar para pintar flecha luego
+                    active_moves.append({
+                        "color": c,
+                        "start": (x, y),
+                        "end": (tx, ty)
+                    })
+
+        # B) Dibujar Targets (Cruces)
         for c, pos in targets.items():
             tx, ty = int(pos["x"]), int(pos["y"])
             bgr = COLOR_TO_BGR.get(c, (255, 255, 255))
+            # Cruz grande
             cv2.drawMarker(img, (tx, ty), bgr, cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
-            cv2.putText(img, f"target:{c}", (tx+12, ty+18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2, cv2.LINE_AA)
+            # Etiqueta
+            cv2.putText(img, f"T:{c}", (tx+10, ty+20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 1, cv2.LINE_AA)
 
-        # Lineas
-        target_points = {c: (int(p["x"]), int(p["y"])) for c, p in targets.items()}
-        for item in cubes:
-            c = item["color"]
-            sx, sy = int(item["x"]), int(item["y"])
-            if c in target_points:
-                tx, ty = target_points[c]
-                bgr = COLOR_TO_BGR.get(c, (200, 200, 200))
-                cv2.line(img, (sx, sy), (tx, ty), bgr, 2, cv2.LINE_AA)
+        # C) Dibujar Flechas de movimiento (Solo para los activos)
+        for move in active_moves:
+            sx, sy = move["start"]
+            tx, ty = move["end"]
+            color_name = move["color"]
+            bgr = COLOR_TO_BGR.get(color_name, (200, 200, 200))
+            
+            # Flecha desde el cubo hasta el target
+            cv2.arrowedLine(img, (sx, sy), (tx, ty), bgr, 3, cv2.LINE_AA, tipLength=0.05)
 
+        # -----------------------------------------------------------
+        # 4. SALIDA
+        # -----------------------------------------------------------
+        
+        # A) Mostrar en la GUI del PC
         self._show_qimage_from_cv(img, self.secondImgLbl)
-        self.secondImgLbl.setToolTip("RESET photo with plan overlay")
+        self.secondImgLbl.setToolTip("Plan Visualization")
         self.countdownLbl.setText("Plan Ready!")
 
     # =========================================================================
@@ -520,121 +597,230 @@ class CaptureWindow(QtWidgets.QWidget):
         except Exception as e:
             rospy.logwarn(f"[GUI] overlay error: {e}")
 
+    def on_set_targets_clicked(self):
+        """Guarda la posición actual de los cubos como el nuevo OBJETIVO."""
+        if not self.current_plan or "cubes" not in self.current_plan:
+            self.resultLbl.setText("No cubes detected yet. Analyze first!")
+            return
+
+        # Inicializar servicio de transformación si no existe
+        if HAS_ROBOT_MODULES and self.srv_transform is None:
+            rospy.wait_for_service('/vlm/transform_pose')
+            self.srv_transform = rospy.ServiceProxy('/vlm/transform_pose', TransformPose)
+
+        # Limpiamos targets anteriores
+        self.saved_targets_visual = {}
+        self.saved_targets_physical = {}
+
+        img_w = self.current_plan.get("_image_size", {}).get("width", 640)
+        img_h = self.current_plan.get("_image_size", {}).get("height", 480)
+
+        cubes = self.current_plan.get("cubes", [])
+        count = 0
+
+        for item in cubes:
+            color = normalize_color(item.get("color", ""))
+            if not color: continue
+
+            # 1. GUARDAR VISUAL (Normalizado 0-1000)
+            yx = item.get("yx", None) # [y, x]
+            if yx:
+                self.saved_targets_visual[color] = yx
+                
+                # 2. CALCULAR Y GUARDAR FÍSICO (Metros)
+                # Necesitamos convertir a pixeles para pedir la transformación
+                y_px, x_px = self._denorm_yx1000_to_px(yx[0], yx[1], img_w, img_h)
+                
+                if HAS_ROBOT_MODULES and y_px is not None:
+                    try:
+                        # Preguntamos al robot: "¿Dónde es este píxel en el mundo real?"
+                        res = self.srv_transform(cam_x=float(x_px), cam_y=float(y_px), cam_z_depth=1.0)
+                        if res.success:
+                            # Guardamos la posición base_x, base_y y la altura z (podemos forzar z=0.85 si es mesa)
+                            self.saved_targets_physical[color] = (res.base_x, res.base_y, 0.85)
+                            count += 1
+                    except Exception as e:
+                        rospy.logerr(f"Error transforming target for {color}: {e}")
+
+        # Feedback visual
+        msg = f"Saved {count} targets! (Redrawing...)"
+        self.resultLbl.setText(msg)
+        print(f"VISUAL TARGETS: {self.saved_targets_visual}")
+        print(f"PHYSICAL TARGETS: {self.saved_targets_physical}")
+
+        # Redibujar la imagen para que aparezcan las cruces en los nuevos sitios
+        if hasattr(self, 'last_img_path'): # Asegúrate de guardar el path de la imagen en algún lado
+            self._annotate_image_with_plan(self.first_path, self.current_plan) # first_path suele ser la guardada
+
     def on_execute_clicked(self):
-        """Recorre el plan, transforma coordenadas y manda al robot."""
+        """
+        Ejecuta la secuencia de pick & place para TODOS los cubos detectados.
+        - Ignora la lista 'order' del VLM (para evitar olvidos).
+        - Ordena físicamente de Derecha a Izquierda (seguridad).
+        - Filtra movimientos si el cubo ya está cerca del target (<40px).
+        """
         if not HAS_ROBOT_MODULES:
             self.resultLbl.setText("ERROR: Mensajes del robot no disponibles.")
             return
         if not self.current_plan:
             return
 
-        # Inicializar Clientes (Lazy Loading)
+        # -------------------------------------------------------------------------
+        # 1. INICIALIZACIÓN DE CLIENTES (Lazy Loading)
+        # -------------------------------------------------------------------------
         if self.ac_pickup is None:
             self.ac_pickup = actionlib.SimpleActionClient('/vlm/pickup', PickUpAction)
-            rospy.loginfo("Esperando servidor de Acción PickUp...")
-            # self.ac_pickup.wait_for_server(rospy.Duration(2.0)) # Opcional timeout
+            rospy.loginfo("Conectando con servidor PickUp...")
+            # self.ac_pickup.wait_for_server(rospy.Duration(2.0))
 
         if self.srv_transform is None:
             rospy.wait_for_service('/vlm/transform_pose')
             self.srv_transform = rospy.ServiceProxy('/vlm/transform_pose', TransformPose)
 
-        # 2. Extraer datos del plan
-        cubes_list = self.current_plan.get("cubes", [])
-        targets_dict = self.current_plan.get("targets", {})
-        order_list = self.current_plan.get("order", [])
+        # -------------------------------------------------------------------------
+        # 2. CONFIGURACIÓN
+        # -------------------------------------------------------------------------
         
-        # Mapa rápido para buscar cubos por color
-        cubes_map = {normalize_color(c.get("color","")): c for c in cubes_list}
+        # Targets Visuales (0-1000) - Deben coincidir con los que pintas en pantalla
+        if self.saved_targets_visual:
+            TARGETS_NORM_YX = self.saved_targets_visual
+        else:
+            TARGETS_NORM_YX = {
+                "yellow": [480, 497], 
+                "green":  [790, 479],
+                "blue":   [580, 804],
+                "red":    [771, 771],
+            }
 
-        # Dimensiones para des-normalizar
+        DIST_THRESHOLD_PX = 40  # Si dist < 40px, consideramos que ya está puesto
+
+        # Dimensiones de la imagen para des-normalizar
         img_w = 640
         img_h = 480
         if "_image_size" in self.current_plan:
             img_w = self.current_plan["_image_size"].get("width", 640)
             img_h = self.current_plan["_image_size"].get("height", 480)
 
-        self.resultLbl.setText("Executing Sequence (R -> L)...")
+        self.resultLbl.setText("Executing ALL detected cubes (Right -> Left)...")
         QtWidgets.QApplication.processEvents()
 
-        # --- MODIFICACIÓN: Ordenar de Derecha (Mayor X) a Izquierda (Menor X) ---
+        # -------------------------------------------------------------------------
+        # 3. PREPARACIÓN DE LA LISTA DE EJECUCIÓN
+        # -------------------------------------------------------------------------
+        
+        cubes_list = self.current_plan.get("cubes", [])
+        
+        # Mapa rápido: "color" -> {datos del cubo}
+        cubes_map = {normalize_color(c.get("color","")): c for c in cubes_list}
+        
+        # Lista de colores encontrados (ignoramos 'order' del VLM, usamos lo que vemos)
+        found_colors = [normalize_color(c.get("color","")) for c in cubes_list if c.get("color")]
+
+        # Función helper para obtener coordenada X (para ordenar)
         def get_x_coord(color_name):
             c_norm = normalize_color(color_name)
             if c_norm not in cubes_map: return -1
-            # yx -> [y, x]. Queremos el índice 1 (x)
             cube_data = cubes_map[c_norm]
             if "yx" in cube_data:
-                return cube_data["yx"][1] # Formato VLM 0-1000
+                return cube_data["yx"][1] # yx[1] es X
             elif "x" in cube_data:
-                return cube_data["x"]     # Formato pseudo (pixels)
+                return cube_data["x"]
             return -1
 
-        # Orden descendente (reverse=True)
-        sorted_order_list = sorted(order_list, key=get_x_coord, reverse=True)
-        rospy.loginfo(f"Execution Order (Right->Left): {sorted_order_list}")
+        # ORDENAR: De mayor X (derecha) a menor X (izquierda) para evitar colisiones
+        sorted_execution_list = sorted(found_colors, key=get_x_coord, reverse=True)
+        rospy.loginfo(f"Execution Order (Auto-detected R->L): {sorted_execution_list}")
 
-        # 3. Ejecutar Secuencia
-        for color_raw in sorted_order_list:
-            color = normalize_color(color_raw)
+        # -------------------------------------------------------------------------
+        # 4. BUCLE DE EJECUCIÓN
+        # -------------------------------------------------------------------------
+        for color in sorted_execution_list:
             
+            # --- A. VERIFICAR DATOS ---
             if color not in cubes_map:
-                rospy.logwarn(f"Skipping {color}: data missing in plan.")
                 continue
 
-            # --- A. OBTENER PIXELES (PICK) ---
             cube_data = cubes_map[color]
             cy_norm, cx_norm = cube_data.get("yx", [0,0])
+            
+            # Convertir posición del cubo a Píxeles
             py_px, px_px = self._denorm_yx1000_to_px(cy_norm, cx_norm, img_w, img_h)
 
-            #rospy.loginfo(f"Procesando {color}: PickPx({px_px},{py_px}) -> PlacePx({lx_px},{ly_px})")
+            if py_px is None or px_px is None:
+                rospy.logwarn(f"Skipping {color}: Invalid pixel coordinates.")
+                continue
 
-            # --- C. LLAMAR AL SERVICIO DE TRANSFORMACIÓN (Pixels -> Meters) ---
-            try:
-                # Transformar PICK
-                res_pick = self.srv_transform(cam_x=float(px_px), cam_y=float(py_px), cam_z_depth=1.0) 
-                if not res_pick.success: raise Exception("Transform Pick Failed")
+            # --- B. FILTRO DE DISTANCIA (¿Ya está en su sitio?) ---
+            should_move = True
+            
+            if color in TARGETS_NORM_YX:
+                ty_norm, tx_norm = TARGETS_NORM_YX[color]
+                ty_px, tx_px = self._denorm_yx1000_to_px(ty_norm, tx_norm, img_w, img_h)
                 
-                # Transformar PLACE
+                if ty_px is not None and tx_px is not None:
+                    # Distancia Euclidiana
+                    dist = math.hypot(px_px - tx_px, py_px - ty_px)
+                    
+                    if dist < DIST_THRESHOLD_PX:
+                        msg = f"SKIPPING {color}: Already at target (Dist: {dist:.1f}px)"
+                        rospy.loginfo(msg)
+                        self.resultLbl.setText(msg)
+                        QtWidgets.QApplication.processEvents()
+                        should_move = False
+                    else:
+                        msg = f"MOVING{color}: Target (Dist: {dist:.1f}px)"
+                        rospy.loginfo(msg)
+                        self.resultLbl.setText(msg)
+            
+            if not should_move:
+                continue
+
+            # --- C. VERIFICAR DESTINO FÍSICO ---
+            if color not in FIXED_TARGETS_METERS:
+                rospy.logwarn(f"Skipping {color}: No physical target in FIXED_TARGETS_METERS.")
+                continue
+
+            # --- D. TRANSFORMACIÓN (2D -> 3D) ---
+            try:
+                # Asumimos profundidad Z=1.0m o lo que use tu cámara cenital
+                res_pick = self.srv_transform(cam_x=float(px_px), cam_y=float(py_px), cam_z_depth=1.0) 
+                if not res_pick.success: 
+                    raise Exception("Transform Pick Failed")
             except Exception as e:
                 rospy.logerr(f"Error transformando coordenadas para {color}: {e}")
                 continue
-            # --- B. PLACE (Destino): Viene de la LISTA FIJA ---
-            # Cogemos la coordenada i de nuestra lista hardcodeada
-            tgt_x, tgt_y, tgt_z = FIXED_TARGETS_METERS[color]
 
-            rospy.loginfo(f"Moving {color}: Vision({res_pick.base_x:.2f}, {res_pick.base_y:.2f}) -> Fixed({tgt_x}, {tgt_y})")
-            # --- D. ENVIAR ACCIÓN AL ROBOT ---
+            tgt_x, tgt_y, tgt_z = FIXED_TARGETS_METERS[color]
+            rospy.loginfo(f"Moving {color} -> Fixed({tgt_x}, {tgt_y})")
+
+            # --- E. ENVIAR ACCIÓN AL ROBOT ---
             goal = PickUpGoal()
             goal.pick_x = res_pick.base_x
             goal.pick_y = res_pick.base_y
-            #goal.pick_z = res_pick.base_z
-            goal.pick_z = 0.65
-            goal.place_x = tgt_x
-            #goal.place_x = -0.30
-            goal.place_y = tgt_y
-            #goal.place_y = 0.50
-            goal.place_z = tgt_z
-            #goal.place_z = 0.50
-            goal.use_cube_mode = False
-            #goal.torso_height = 0.30
+            goal.pick_z = 0.65 # Altura segura para agarrar (mesa ~0.8m?)
             
-            # Opciones
-            goal.use_cube_mode = False # Es un cubo, ignoramos Yaw
-            # goal.torso_height = 0.30 # ELIMINADO (según tu petición)
+            goal.place_x = tgt_x
+            goal.place_y = tgt_y
+            goal.place_z = tgt_z
+            
+            goal.use_cube_mode = False # Asumimos modo normal
 
-            rospy.loginfo(f"Enviando Acción para {color}...")
             self.ac_pickup.send_goal(goal, feedback_cb=self._robot_feedback_cb)
             
             # Esperar a que termine este movimiento antes del siguiente
             while not self.ac_pickup.wait_for_result(rospy.Duration(0.1)):
-                QtWidgets.QApplication.processEvents() # Mantiene la GUI viva
+                QtWidgets.QApplication.processEvents()
             
             result = self.ac_pickup.get_result()
             if not result.success:
                 self.resultLbl.setText(f"Error moving {color}: {result.message}")
-                # Opcional: return para parar todo, o continue para intentar el siguiente
+                # Decisión: Si falla uno, continuamos con el siguiente
                 continue
 
-        self.resultLbl.setText("Sequence Completed Successfully!")
+        # -------------------------------------------------------------------------
+        # 5. FINALIZACIÓN
+        # -------------------------------------------------------------------------
+        self.resultLbl.setText("Sequence Completed!")
         self.countdownLbl.setText("Robot Done.")
 
     def _robot_feedback_cb(self, feedback):
