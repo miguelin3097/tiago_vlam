@@ -184,6 +184,7 @@ catkin_install_python(PROGRAMS
    scripts/depth_transform.py
    scripts/pickup_server.py
    scripts/transform_server.py
+   scripts/tiago_web_display.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
