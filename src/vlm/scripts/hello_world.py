@@ -72,22 +72,54 @@ def normalize_color(token: str) -> str:
 
 def parse_predicted_order(answer_text: str):
     """
-    Extrae orden y assessment del JSON de respuesta.
+    Extrae orden, assessment y feedback del JSON de respuesta.
+    Respeta las mayúsculas del feedback.
     """
     if not answer_text:
-        return [], None
+        return [], None, "No answer received."
 
-    txt = answer_text.strip().lower()
-    # Intento básico de limpiar markdown si el modelo lo mete
+    # 1. Limpieza básica (SIN .lower() global)
+    txt = answer_text.strip()
+    
+    # Limpiar markdown de código si Gemini lo incluye
     if txt.startswith("```json"):
-        txt = txt.replace("```json", "").replace("```", "")
+        txt = txt[7:]
+    elif txt.startswith("```"):
+        txt = txt[3:]
+    
+    if txt.endswith("```"):
+        txt = txt[:-3]
+    
+    txt = txt.strip()
     
     try:
+        # 2. Parsear el JSON con el texto original (preservando mayúsculas)
         answer_json = json.loads(txt)
-        return answer_json.get("order", []), answer_json.get("assestment", None)
+        
+        # 3. Normalizar las claves del diccionario a minúsculas
+        # Esto es para que funcione igual si Gemini devuelve "Order" o "order"
+        data_lower_keys = {k.lower(): v for k, v in answer_json.items()}
+        
+        # --- A. EL ORDEN (Lo normalizamos nosotros a minúsculas/mayúsculas según prefieras) ---
+        raw_order = data_lower_keys.get("order", [])
+        # Convertimos los colores a minúsculas para que tu lógica de comparación no falle
+        final_order = [str(c).lower() for c in raw_order] 
+        
+        # --- B. EL ASSESSMENT ---
+        # Buscamos 'assessment', 'assestment' (tu typo original) o 'is_correct'
+        assessment = data_lower_keys.get("assessment", 
+                        data_lower_keys.get("assestment", 
+                            data_lower_keys.get("is_correct", None)))
+
+        # --- C. EL FEEDBACK (Lo dejamos INTACTO) ---
+        feedback = data_lower_keys.get("feedback", "No specific feedback provided.")
+        
+        return final_order, assessment, feedback
+
     except json.JSONDecodeError:
         rospy.logwarn(f"Error decodificando JSON del VLM: {txt[:50]}...")
-        return [], None
+        # Devolvemos valores seguros en caso de error
+        return [], None, "Error processing results."
 
 
 # =========================
@@ -117,12 +149,40 @@ class ImageBuffer(object):
 # GUI principal
 # =========================
 DEFAULT_TOPIC = "/xtion/rgb/image_raw"
-DEFAULT_PROMPT = (
-    "Look at the final image and note the order of the cubes from left to right. "
-    "The cubes must form a straight horizontal line. "
-    "The answer format must be strictly JSON with keys 'order' (list of colors) and "
-    "'assestment' (boolean, true if matches GT: [GT]). Return only valid JSON."
-)
+DEFAULT_PROMPT = f"""
+        You are a warm, empathetic rehabilitation assistant talking directly to a patient.
+        INPUT: Two images (Start vs End).
+        
+        CRITICAL CONTEXT:
+        - Patient sits opposite you.
+        - Patient's "Left-to-Right" is your "Right-to-Left".
+        
+        STRICT FILTERING RULES (Do not ignore this):
+        1. **DEFINE THE LINE:** Identify the main group of cubes forming a horizontal line.
+        2. **EXCLUDE OUTLIERS:** If a cube is NOT part of that straight line (e.g. it is scattered, far away, or left behind), **DO NOT INCLUDE IT** in the JSON "order" list. The "order" list must ONLY contain the aligned cubes.
+        
+        TASKS:
+        1. Construct the "order" list based ONLY on the aligned cubes, reading from **RIGHT TO LEFT**.
+        2. Compare this list with the Goal: [GT].
+        3. If the list is shorter than the Goal (because cubes were excluded/missing), assessment is false.
+
+        OUTPUT FORMAT (Strict JSON):
+        {{
+            "order": ["color1", "color2"], 
+            "assessment": true/false, 
+            "feedback": "TEXT"
+        }}
+        
+        INSTRUCTIONS FOR 'feedback':
+        - **TONE:** Supportive.
+        - **LENGTH:** Concise (max 2 sentences).
+        - **SCENARIO (Cubes excluded):** "I see a cube left out! Please place ALL cubes in the line."
+        - **SCENARIO (Perfect):** "Excellent! All cubes are perfectly aligned and ordered."
+        - **FORMAT:**
+           1. Empathetic message.
+           2. Newline (\\n).
+           3. Stats: "Line: [Yes/No] | Order: [Yes/No]"
+        """
 DEFAULT_PLAN_PROMPT = (
     "Analyze the image. There are colored cubes on a table. "
     "Return STRICT JSON. Schema: "
@@ -217,6 +277,8 @@ class CaptureWindow(QtWidgets.QWidget):
         # ---------Publicador
         self.pub_text_command = rospy.Publisher('/web_display/text', String, queue_size=1)
         self.sub_web_cmd = rospy.Subscriber('/web/command', String, self.on_web_command_received)
+        self.pub_feedback = rospy.Publisher('/web_display/feedback', String, queue_size=1)
+        self.last_gemini_feedback = "Waiting for analysis..."
 
         
 
@@ -990,7 +1052,8 @@ class CaptureWindow(QtWidgets.QWidget):
         t1 = time.time()
         latency_ms = int((t1 - t0) * 1000)
         raw = getattr(resp, "answer", "") if hasattr(resp, "answer") else ""
-        pred_order, pred_is_correct = parse_predicted_order(raw)
+        pred_order, pred_is_correct, feedback = parse_predicted_order(raw)
+        self.last_gemini_feedback = feedback
         return raw, pred_order, pred_is_correct, latency_ms
 
     def _call_finalize_session(self, **kwargs):
@@ -1063,6 +1126,8 @@ class CaptureWindow(QtWidgets.QWidget):
                 move_files=True
             )
             self.resultLbl.setText(summary)
+            rospy.loginfo(f"Enviando feedback a pantalla robot...")
+            self.pub_feedback.publish(self.last_gemini_feedback)
         except Exception as e:
             self.resultLbl.setText(f"ERROR saving session: {e}")
 

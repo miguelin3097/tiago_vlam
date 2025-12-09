@@ -7,7 +7,8 @@ import threading
 import time
 import socket
 import numpy as np
-from flask import Flask, Response
+import json
+from flask import Flask, Response, jsonify
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from cv_bridge import CvBridge, CvBridgeError
@@ -18,29 +19,39 @@ from cv_bridge import CvBridge, CvBridgeError
 TOPIC_IMG = '/robot/xdisplay'
 TOPIC_TEXT = '/web_display/text'
 TOPIC_CMD = '/web/command'
+TOPIC_FEEDBACK = '/web_display/feedback'
 WEB_PORT = 5000
 
-# ==========================================
+# COLORES
+COLOR_DB = {
+    "RED": (0, 0, 255), "GREEN": (0, 255, 0), "BLUE": (255, 0, 0),
+    "YELLOW": (0, 255, 255), "ORANGE": (0, 165, 255), "PURPLE": (128, 0, 128),
+    "PINK": (147, 20, 255), "BLACK": (50, 50, 50), "WHITE": (255, 255, 255)
+}
+
 # ESTADO GLOBAL
-# ==========================================
 app = Flask(__name__)
 latest_image = None
 image_lock = threading.Lock()
 pub_command = None
 
+# VARIABLES DE CONTROL
+doing_countdown = False
+pending_text = None 
+current_difficulty = "TEXT" 
+last_received_text = ""
+feedback_ready = False  # <--- NUEVO: Indica si el análisis ha terminado
+
 # ==========================================
-# CLASE ROS (NODO)
+# CLASE ROS
 # ==========================================
 class WebDisplayNode:
     def __init__(self):
-        # Nota: El nodo se inicia en el main, no aquí
         self.bridge = CvBridge()
-        
-        # Suscriptores
         self.sub_img = rospy.Subscriber(TOPIC_IMG, Image, self.image_callback)
         self.sub_text = rospy.Subscriber(TOPIC_TEXT, String, self.text_callback)
+        self.sub_feedback = rospy.Subscriber(TOPIC_FEEDBACK, String, self.feedback_callback)
         
-        # Publicador (Para enviar START/STOP al otro programa)
         global pub_command
         pub_command = rospy.Publisher(TOPIC_CMD, String, queue_size=1)
 
@@ -48,99 +59,135 @@ class WebDisplayNode:
         global latest_image
         try:
             cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            with image_lock:
-                latest_image = cv_img
-        except CvBridgeError as e:
-            rospy.logerr(f"Error bridge: {e}")
+            with image_lock: latest_image = cv_img
+        except CvBridgeError as e: rospy.logerr(f"Error bridge: {e}")
 
     def text_callback(self, msg):
-        """Genera una imagen bonita a partir del texto de la secuencia."""
-        raw_text = msg.data
-        update_image_with_text(raw_text)
+        global pending_text, doing_countdown, last_received_text
+        last_received_text = msg.data 
+        if doing_countdown: pending_text = msg.data
+        else: update_image_with_text(msg.data)
+
+    def feedback_callback(self, msg):
+        global feedback_ready
+        rospy.loginfo(f"Feedback recibido: {msg.data}")
+        
+        # 1. Mostrar resultados en la imagen
+        show_results_screen(msg.data)
+        
+        # 2. Avisar al navegador que ya puede mostrar el botón Reset
+        feedback_ready = True
 
 # ==========================================
 # UTILIDADES GRÁFICAS
 # ==========================================
 def create_image_canvas(bg_color=(0, 0, 0)):
-    """Crea un lienzo vacío del tamaño de la pantalla."""
     h, w = 600, 1024
     img = np.zeros((h, w, 3), dtype=np.uint8)
-    img[:] = bg_color # Rellenar color fondo
+    img[:] = bg_color 
     return img, w, h
 
-def update_image_with_text(text, bg_color=(0, 0, 0), title="SEQUENCE:"):
-    """Helper para crear una imagen con texto y actualizar la global."""
+def draw_centered_text(img, text, y, font, scale, color, thickness):
+    h, w = img.shape[:2]
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+    x = (w - tw) // 2
+    cv2.putText(img, text, (x, y), font, scale, color, thickness)
+
+# --- PANTALLA DE RESULTADOS ---
+def show_results_screen(text_report):
     global latest_image
-    
-    img, w, h = create_image_canvas(bg_color)
-    
-    # Formatear texto (flechas)
-    if "," in text:
-        parts = [p.strip().upper() for p in text.split(',')]
-        formatted_text = " -> ".join(parts)
-    else:
-        formatted_text = text.upper()
-
-    # Config Fuente
+    img, w, h = create_image_canvas(bg_color=(50, 20, 0)) 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 1.8
-    thickness = 4
+
+    draw_centered_text(img, "RESULTS", 60, font, 1.5, (255, 255, 255), 3)
+    cv2.line(img, (50, 80), (w-50, 80), (200, 200, 200), 2)
+
+    explicit_lines = text_report.split('\n')
+    final_lines = []
     
-    # Calcular centro
-    (text_w, text_h), _ = cv2.getTextSize(formatted_text, font, font_scale, thickness)
+    for explicit_line in explicit_lines:
+        words = explicit_line.split(' ')
+        current_line = ""
+        for word in words:
+            if len(current_line) + len(word) < 45:
+                current_line += word + " "
+            else:
+                final_lines.append(current_line)
+                current_line = word + " "
+        final_lines.append(current_line)
+
+    start_y = 140
+    line_height = 50
     
-    # Ajustar si es muy largo
-    if text_w > (w - 60):
-        font_scale = 1.0
-        thickness = 2
+    for i, line in enumerate(final_lines[:8]):
+        color = (180, 255, 180) 
+        if "Line:" in line or "Order:" in line or "Cubes" in line:
+            color = (255, 255, 0)
+        draw_centered_text(img, line, start_y + (i * line_height), font, 1.1, color, 2)
+
+    draw_centered_text(img, "Press RESET to start new session", h-30, font, 0.7, (100, 100, 255), 1)
+    with image_lock: latest_image = img
+
+def show_instructions():
+    global latest_image
+    img, w, h = create_image_canvas(bg_color=(20, 20, 20))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    draw_centered_text(img, "EXERCISE GOAL:", 80, font, 1.0, (180, 180, 180), 2)
+    draw_centered_text(img, "SORT BY COLOR", 200, font, 2.5, (255, 255, 255), 5)
+    draw_centered_text(img, "Place cubes in a", 300, font, 1.5, (200, 200, 200), 2)
+    draw_centered_text(img, "HORIZONTAL LINE", 370, font, 2.0, (0, 255, 255), 4)
+    draw_centered_text(img, "( Left  --->  Right )", 450, font, 1.2, (200, 200, 200), 2)
+    draw_centered_text(img, "Select difficulty & Press START", 560, font, 0.8, (0, 200, 0), 2)
+    with image_lock: latest_image = img
+
+def update_image_with_text(text, bg_color=(0, 0, 0), title="SEQUENCE:"):
+    global latest_image, current_difficulty
+    img, w, h = create_image_canvas(bg_color)
+    if "," in text: parts = [p.strip().upper() for p in text.split(',')]
+    else: parts = [text.strip().upper()]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    if title: cv2.putText(img, title, (50, 80), font, 1, (200, 200, 200), 2)
+
+    if current_difficulty == "TEXT":
+        formatted_text = " -> ".join(parts)
+        font_scale = 1.8; thickness = 4
         (text_w, text_h), _ = cv2.getTextSize(formatted_text, font, font_scale, thickness)
-
-    x = (w - text_w) // 2
-    y = (h + text_h) // 2
-
-    # Dibujar
-    if title:
-        cv2.putText(img, title, (50, 80), font, 1, (200, 200, 200), 2)
-    
-    cv2.putText(img, formatted_text, (x, y), font, font_scale, (255, 255, 255), thickness)
-    cv2.line(img, (x, y + 25), (x + text_w, y + 25), (0, 255, 255), 2)
-
-    with image_lock:
-        latest_image = img
+        if text_w > (w - 60): 
+            font_scale = 1.0; thickness = 2
+            (text_w, text_h), _ = cv2.getTextSize(formatted_text, font, font_scale, thickness)
+        x = (w - text_w) // 2; y = (h + text_h) // 2
+        cv2.putText(img, formatted_text, (x, y), font, font_scale, (255, 255, 255), thickness)
+        cv2.line(img, (x, y + 25), (x + text_w, y + 25), (0, 255, 255), 2)
+    else:
+        num_cubes = len(parts); cube_size = 120; gap = 80
+        total_width = (num_cubes * cube_size) + ((num_cubes - 1) * gap)
+        start_x = (w - total_width) // 2; center_y = h // 2; top_y = center_y - (cube_size // 2)
+        for i, color_name in enumerate(parts):
+            bgr = COLOR_DB.get(color_name, (128, 128, 128))
+            x1 = start_x + i * (cube_size + gap); y1 = top_y; x2 = x1 + cube_size; y2 = y1 + cube_size
+            cv2.rectangle(img, (x1, y1), (x2, y2), bgr, -1)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 3)
+            if i < num_cubes - 1:
+                cv2.arrowedLine(img, (x2 + 10, center_y), (x2 + gap - 10, center_y), (200, 200, 200), 4, tipLength=0.3)
+    with image_lock: latest_image = img
 
 def update_image_simple_message(main_text, sub_text="", bg_color=(0, 100, 0)):
-    """Muestra un mensaje simple (Ej: WELL DONE)."""
     global latest_image
     img, w, h = create_image_canvas(bg_color)
-    
     font = cv2.FONT_HERSHEY_SIMPLEX
-    
-    # Texto Principal
-    (tw, th), _ = cv2.getTextSize(main_text, font, 3.0, 5)
-    cv2.putText(img, main_text, ((w-tw)//2, (h+th)//2 - 40), font, 3.0, (255,255,255), 5)
-    
-    # Subtexto
-    if sub_text:
-        (tw2, th2), _ = cv2.getTextSize(sub_text, font, 1.2, 2)
-        cv2.putText(img, sub_text, ((w-tw2)//2, (h+th)//2 + 60), font, 1.2, (200,200,200), 2)
-
-    with image_lock:
-        latest_image = img
+    draw_centered_text(img, main_text, (h//2) - 40, font, 3.0, (255,255,255), 5)
+    if sub_text: draw_centered_text(img, sub_text, (h//2) + 60, font, 1.2, (200,200,200), 2)
+    with image_lock: latest_image = img
 
 # ==========================================
 # FLASK SERVER
 # ==========================================
 def generate_mjpeg_stream():
     global latest_image
+    if latest_image is None: show_instructions()
     while True:
         with image_lock:
-            if latest_image is None:
-                img, w, h = create_image_canvas()
-                cv2.putText(img, "READY TO START...", (300, 300), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255,255,255), 2)
-                frame = img
-            else:
-                frame = latest_image.copy()
-
+            frame = latest_image.copy() if latest_image is not None else np.zeros((600,1024,3), np.uint8)
         ret, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
         time.sleep(0.1)
@@ -152,105 +199,202 @@ def index():
     <head>
         <title>TIAGo Controller</title>
         <style>
-            body { margin: 0; background: #000; height: 100vh; display: flex; flex-direction: column;
-                   justify-content: center; align-items: center; overflow: hidden; font-family: sans-serif;}
-            img { max-width: 100%; max-height: 100%; object-fit: contain; }
-            
-            .btn-toggle {
-                position: absolute; bottom: 30px; padding: 25px 50px;
-                font-size: 28px; font-weight: bold; color: white;
-                background-color: #4CAF50; border: none; border-radius: 60px;
-                cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,0.6);
-                transition: all 0.2s; text-transform: uppercase;
+            body { 
+                margin: 0; background: #000; height: 100vh; 
+                display: flex; flex-direction: column;
+                align-items: center; justify-content: center; 
+                font-family: sans-serif;
             }
-            .btn-toggle:active { transform: scale(0.95); }
-            .btn-stop { background-color: #f44336 !important; box-shadow: 0 0 15px #f44336; }
+            .image-container {
+                flex: 1; display: flex; align-items: center; justify-content: center;
+                width: 100%; overflow: hidden;
+            }
+            img { max-width: 100%; max-height: 95%; object-fit: contain; }
+            .controls { 
+                display: flex; flex-direction: column; gap: 20px; 
+                align-items: center; justify-content: center; 
+                padding-bottom: 40px; width: 100%; min-height: 150px; 
+            }
+            .btn-base {
+                padding: 20px 50px; font-size: 26px; font-weight: bold; color: white;
+                border: none; border-radius: 50px; cursor: pointer;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.6);
+                text-transform: uppercase; min-width: 300px; text-align: center;
+                transition: transform 0.1s;
+            }
+            .btn-base:active { transform: scale(0.98); }
+            .btn-start { background-color: #4CAF50; display: block; } 
+            .btn-stop { background-color: #f44336; display: none; }   
+            .btn-reset { background-color: #2196F3; display: none; }  
+
+            .switch-container {
+                display: flex; align-items: center; color: white; 
+                font-size: 20px; font-weight: bold; background: #333; 
+                padding: 10px 25px; border-radius: 40px;
+                box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+                margin-bottom: 10px;
+            }
+            .switch { position: relative; display: inline-block; width: 60px; height: 34px; margin: 0 15px; }
+            .switch input { opacity: 0; width: 0; height: 0; }
+            .slider {
+                position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+                background-color: #ccc; transition: .4s; border-radius: 34px;
+            }
+            .slider:before {
+                position: absolute; content: ""; height: 26px; width: 26px; left: 4px; bottom: 4px;
+                background-color: white; transition: .4s; border-radius: 50%;
+            }
+            input:checked + .slider { background-color: #9C27B0; }
+            input:checked + .slider:before { transform: translateX(26px); }
         </style>
         <script>
-            let isRunning = false;
-            function toggleState() {
-                const btn = document.getElementById("mainBtn");
-                if (!isRunning) {
-                    fetch('/trigger_start').then(() => {
-                        isRunning = true;
-                        btn.innerText = "⏹ STOP EXERCISE";
-                        btn.classList.add("btn-stop");
-                    });
-                } else {
-                    fetch('/trigger_stop').then(() => {
-                        isRunning = false;
-                        btn.innerText = "▶ START EXERCISE";
-                        btn.classList.remove("btn-stop");
-                    });
-                }
+            let isBusy = false; 
+            let checkInterval = null;
+
+            function toggleDifficulty(checkbox) {
+                const mode = checkbox.checked ? 'VISUAL' : 'TEXT';
+                fetch('/set_difficulty/' + mode);
+            }
+
+            function clickStart() {
+                if (isBusy) return; isBusy = true;
+                document.getElementById("btnStart").style.display = "none";
+                document.getElementById("diffPanel").style.display = "none";
+                fetch('/trigger_start');
+                setTimeout(() => {
+                    document.getElementById("btnStop").style.display = "block";
+                    isBusy = false;
+                }, 11000);
+            }
+
+            function clickStop() {
+                if (isBusy) return; isBusy = true;
+                
+                // 1. Ocultar botón STOP
+                document.getElementById("btnStop").style.display = "none";
+                
+                // 2. Enviar orden de paro
+                fetch('/trigger_stop');
+
+                // 3. Empezar a preguntar al servidor si ya hay feedback
+                // Comprobamos cada 1 segundo (1000ms)
+                checkInterval = setInterval(() => {
+                    fetch('/check_status')
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.feedback_ready === true) {
+                                // YA LLEGÓ EL FEEDBACK!
+                                clearInterval(checkInterval); // Dejar de preguntar
+                                document.getElementById("btnReset").style.display = "block"; // Mostrar botón
+                                isBusy = false;
+                            }
+                        })
+                        .catch(err => console.error(err));
+                }, 1000);
+            }
+
+            function clickReset() {
+                if (isBusy) return;
+                
+                // Limpiar flag visualmente
+                document.getElementById("btnReset").style.display = "none";
+                
+                fetch('/trigger_reset');
+                
+                setTimeout(() => {
+                    document.getElementById("btnStart").style.display = "block";
+                    document.getElementById("diffPanel").style.display = "flex";
+                }, 1000);
             }
         </script>
     </head>
     <body>
-        <img src="/video_feed">
-        <button id="mainBtn" class="btn-toggle" onclick="toggleState()">▶ START EXERCISE</button>
+        <div class="image-container"><img src="/video_feed"></div>
+        <div class="controls">
+            <div id="diffPanel" class="switch-container">
+                <span>TEXT</span>
+                <label class="switch">
+                    <input type="checkbox" onchange="toggleDifficulty(this)">
+                    <span class="slider"></span>
+                </label>
+                <span>VISUAL</span>
+            </div>
+            <button id="btnStart" class="btn-base btn-start" onclick="clickStart()">▶ START EXERCISE</button>
+            <button id="btnStop"  class="btn-base btn-stop"  onclick="clickStop()">⏹ STOP EXERCISE</button>
+            <button id="btnReset" class="btn-base btn-reset" onclick="clickReset()">↻ RESET EXERCISE</button>
+        </div>
     </body>
     </html>
     """
 
 @app.route('/video_feed')
-def video_feed():
-    return Response(generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+def video_feed(): return Response(generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/set_difficulty/<mode>')
+def set_difficulty(mode):
+    global current_difficulty
+    current_difficulty = mode
+    rospy.loginfo(f"Dificultad cambiada a: {mode}")
+    return "OK"
+
+# --- NUEVA RUTA PARA EL SONDEO (POLLING) ---
+@app.route('/check_status')
+def check_status():
+    global feedback_ready
+    return jsonify({"feedback_ready": feedback_ready})
 
 @app.route('/trigger_start')
 def trigger_start():
-    if pub_command:
-        pub_command.publish("start")
-        # Mostrar mensaje inicial
-        update_image_simple_message("GET READY!", "Exercise starting...", bg_color=(0, 0, 100))
-        rospy.loginfo("WEB: START triggered")
+    global doing_countdown, pending_text, feedback_ready
+    doing_countdown = True; pending_text = None
+    feedback_ready = False # Reiniciamos el estado
+    
+    if pub_command: pub_command.publish("start")
+    
+    def visual_countdown():
+        global doing_countdown, pending_text
+        for i in range(10, 0, -1):
+            update_image_simple_message(f"STARTING IN {i}...", "Get ready!", bg_color=(200, 100, 0))
+            time.sleep(1.0)
+        doing_countdown = False
+        if pending_text: update_image_with_text(pending_text)
+        else: update_image_simple_message("GO!", "Exercise running...", bg_color=(0, 0, 100))
+    threading.Thread(target=visual_countdown, daemon=True).start()
     return "OK"
 
 @app.route('/trigger_stop')
 def trigger_stop():
-    if pub_command:
-        pub_command.publish("stop")
-        # --- AQUÍ ESTÁ EL MENSAJE DE FELICITACIÓN ---
-        update_image_simple_message("WELL DONE!", "Great job!", bg_color=(0, 128, 0))
-        rospy.loginfo("WEB: STOP triggered")
+    global doing_countdown, feedback_ready
+    doing_countdown = False
+    feedback_ready = False # Aseguramos que esté falso mientras analiza
+    
+    def delayed_stop_sequence():
+        for i in range(5, 0, -1):
+            update_image_simple_message(f"FINISHING IN {i}...", "REMOVE HANDS", bg_color=(200, 50, 0))
+            time.sleep(1.0)
+        if pub_command: pub_command.publish("stop")
+        # Mensaje temporal hasta que llegue el feedback
+        update_image_simple_message("ANALYZING!", "Please wait...", bg_color=(0, 100, 50))
+    threading.Thread(target=delayed_stop_sequence, daemon=True).start()
     return "OK"
 
-# ==========================================
-# MAIN Y CIERRE SEGURO
-# ==========================================
-def start_flask():
-    # use_reloader=False evita subprocesos conflictivos
-    app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
+@app.route('/trigger_reset')
+def trigger_reset():
+    global feedback_ready
+    feedback_ready = False # Reset flag
+    if pub_command: pub_command.publish("reset")
+    show_instructions() 
+    return "OK"
+
+def start_flask(): app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
 
 if __name__ == '__main__':
-    # 1. Iniciar ROS
     rospy.init_node('tiago_web_display', anonymous=False)
-    
-    # Mostrar IP
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-    except:
-        ip = "127.0.0.1"
-    
-    rospy.loginfo(f"📺 SERVIDOR WEB ACTIVO")
-    rospy.loginfo(f"🌍 URL: http://{ip}:{WEB_PORT}")
-
-    # 2. Iniciar Lógica del Nodo
     web_node = WebDisplayNode()
-
-    # 3. Arrancar Flask en HILO DAEMON
-    # Esto es la clave para que Control+C funcione
-    flask_thread = threading.Thread(target=start_flask)
-    flask_thread.daemon = True 
-    flask_thread.start()
-
-    # 4. Mantener vivo el programa hasta Control+C
     try:
-        rospy.spin()
-    except KeyboardInterrupt:
-        print("Cerrando servidor web...")
-    
-    # Al salir de aquí, el hilo daemon muere automáticamente.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
+    except: ip = "127.0.0.1"
+    rospy.loginfo(f"📺 WEB: http://{ip}:{WEB_PORT}")
+    flask_thread = threading.Thread(target=start_flask); flask_thread.daemon = True; flask_thread.start()
+    try: rospy.spin()
+    except KeyboardInterrupt: pass
