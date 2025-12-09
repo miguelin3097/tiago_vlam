@@ -13,6 +13,8 @@
     <node pkg="vlm" type="pickup_server.py" name="pick" output="screen"/>
     <node pkg="vlm" type="metrics_server.py" name="metrics" output="screen"/>
     <node pkg="vlm" type="transform_server.py" name="transform" output="screen"/> 
+    <node pkg="vlm" type="tiago_web_display.py" name="web_server" output="screen"/> 
+    
     
 
 </launch>

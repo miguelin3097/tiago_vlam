@@ -15,6 +15,7 @@ import rospy
 import actionlib  # <--- NUEVO: Necesario para ActionClient
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
+from std_msgs.msg import String
 
 # Servicios VLM (Gemini)
 try:
@@ -212,6 +213,10 @@ class CaptureWindow(QtWidgets.QWidget):
         self.resultLbl.setWordWrap(True)
         self.resultLbl.setFrameShape(QtWidgets.QFrame.StyledPanel)
         self.resultLbl.setMinimumHeight(70)
+
+        # ---------Publicador
+        self.pub_text_command = rospy.Publisher('/web_display/text', String, queue_size=1)
+        self.sub_web_cmd = rospy.Subscriber('/web/command', String, self.on_web_command_received)
 
         
 
@@ -651,6 +656,45 @@ class CaptureWindow(QtWidgets.QWidget):
         # Redibujar la imagen para que aparezcan las cruces en los nuevos sitios
         if hasattr(self, 'last_img_path'): # Asegúrate de guardar el path de la imagen en algún lado
             self._annotate_image_with_plan(self.first_path, self.current_plan) # first_path suele ser la guardada
+    
+    def on_web_command_received(self, msg):
+        """
+        Callback que se ejecuta cuando llega un mensaje al topic /web/command
+        """
+        command = msg.data.lower().strip()
+        
+        if command == "start":
+            rospy.loginfo("Recibido comando START remoto desde la Web.")
+            if self.btnStart.isEnabled():
+                self.btnStart.click()
+                
+        elif command == "stop":
+            rospy.loginfo("Recibido comando STOP remoto desde la Web.")
+            # Solo hacemos caso si ya hemos empezado (primera foto hecha) pero no acabado
+            if self.first_done and not self.second_done:
+                # Usamos QMetaObject para llamar a la función en el hilo principal de la GUI
+                QtCore.QMetaObject.invokeMethod(self, "finish_exercise", QtCore.Qt.QueuedConnection)
+
+    @QtCore.pyqtSlot()  # Decorador recomendado para ser llamado desde invokeMethod
+    def finish_exercise(self):
+        """
+        Se llama manualmente al pulsar STOP en la web.
+        Toma la segunda foto y lanza el análisis.
+        """
+        rospy.loginfo("Finalizando ejercicio por orden manual...")
+        
+        # 1. Parar el timer de la interfaz
+        self.timer_ui.stop()
+        
+        # 2. Tomar la segunda foto
+        self._capture_second()
+        self.second_done = True
+        
+        # 3. Actualizar GUI
+        self.countdownLbl.setText("Second photo taken. Analyzing…")
+        
+        # 4. Lanzar el análisis (con un pequeño retardo para que la GUI respire)
+        QtCore.QTimer.singleShot(100, self._after_second_photo)
 
     def on_execute_clicked(self):
         """
@@ -829,6 +873,31 @@ class CaptureWindow(QtWidgets.QWidget):
 
     # ----- Flujo Auditoría -----
     def on_start_clicked(self):
+
+        # --- NUEVO: ENVIAR TEXTO A LA PANTALLA ---
+        # Leemos lo que hay en el cuadro 'GT order'
+        raw_text = self.gtEdit.text()
+        
+        if raw_text:
+            # 1. Traducir/Limpiar (usando tu COLOR_MAP global)
+            # Entrada: "rojo, verde" -> Salida: "red, green"
+            parts = []
+            for p in raw_text.split(','):
+                p = p.strip().lower()
+                if p in COLOR_MAP:
+                    parts.append(COLOR_MAP[p])
+                else:
+                    parts.append(p)
+            
+            final_text = ", ".join(parts)
+            
+            # 2. Publicar
+            rospy.loginfo(f"Enviando GT a pantalla: {final_text}")
+            self.pub_text_command.publish(final_text)
+        else:
+            # Si está vacío, podemos borrar la pantalla o mandar aviso
+            self.pub_text_command.publish("ESPERANDO...")
+
         self.session_id = new_session_id()
         self.session_started_at = datetime.datetime.utcnow()
         self.first_done = False
@@ -845,6 +914,7 @@ class CaptureWindow(QtWidgets.QWidget):
         self.btnStart.setEnabled(False)
         self.resultLbl.setText("")
         self.countdownLbl.setText("Countdown: 5")
+        
 
     def _on_ui_tick(self):
         if self.session_started_at is None:
@@ -852,22 +922,28 @@ class CaptureWindow(QtWidgets.QWidget):
 
         elapsed = time.time() - self._t0
 
+        # PARTE 1: Cuenta atrás inicial (5 segundos) -> Sigue IGUAL
         if not self.first_done:
             left = int(max(0, self.countdown_secs - elapsed))
             self.countdownLbl.setText(f"Countdown: {left}")
             if elapsed >= self.countdown_secs:
                 self._capture_first()
                 self.first_done = True
-                self.countdownLbl.setText("First photo taken. Waiting to 60s…")
+                # CAMBIO: Mensaje indicando espera manual
+                self.countdownLbl.setText("Exercise running... Press STOP on Web to finish.")
                 return
 
+        # PARTE 2: Espera indefinida -> CAMBIO RADICAL
         if self.first_done and not self.second_done:
-            if elapsed >= self.total_secs:
-                self._capture_second()
-                self.second_done = True
-                self.timer_ui.stop()
-                self.countdownLbl.setText("Second photo taken. Analyzing…")
-                QtCore.QTimer.singleShot(100, self._after_second_photo)
+            # ANTES: Comprobaba if elapsed >= self.total_secs
+            # AHORA: No hacemos nada, solo actualizamos el tiempo transcurrido visualmente
+            
+            # Mostramos cuánto tiempo lleva el paciente
+            current_exercise_time = int(elapsed - self.countdown_secs)
+            self.countdownLbl.setText(f"Exercise Time: {current_exercise_time}s (Waiting for STOP)")
+            
+            # ELIMINADO: self._capture_second() automático
+            pass
 
     def _capture_first(self):
         frame = self.img_buffer.get()
