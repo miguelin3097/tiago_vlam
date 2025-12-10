@@ -25,7 +25,7 @@ Quickstart (ROS)
 2. Build and source workspace:
 ```bash
 cd /home/pal/vlm_ws
-catkin_make
+catkin build
 source devel/setup.bash
 ```
 3. Export credentials (if using Gemini):
