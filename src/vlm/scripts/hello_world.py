@@ -10,12 +10,13 @@ import threading
 from pathlib import Path
 import cv2
 import math
+import random
 
 import rospy
 import actionlib  # <--- NUEVO: Necesario para ActionClient
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
-from std_msgs.msg import String
+from std_msgs.msg import String, Empty
 
 # Servicios VLM (Gemini)
 try:
@@ -161,13 +162,18 @@ DEFAULT_PROMPT = f"""
         1. **DEFINE THE LINE:** Identify the main group of cubes forming a horizontal line.
         2. **EXCLUDE OUTLIERS:** If a cube is NOT part of that straight line (e.g. it is scattered, far away, or left behind), **DO NOT INCLUDE IT** in the JSON "order" list. The "order" list must ONLY contain the aligned cubes.
         
-        TASKS:
-        1. Construct the "order" list based ONLY on the aligned cubes, reading from **RIGHT TO LEFT**.
-        2. Compare this list with the Goal: [GT].
-        3. If the list is shorter than the Goal (because cubes were excluded/missing), assessment is false.
+        TASKS (METRICS & LOGIC):
+        1. **COUNT START (Image 1):** Count how many distinct cubes are visible in the first image. -> `n_cubes_detected_start`.
+        2. **COUNT END (Image 2):** Count TOTAL distinct cubes in the second image (both in the line AND scattered outliers) -> `n_cubes_detected_end`.
+        3 **COUNT MOVEMENT:** Compare Image 1 vs Image 2. How many cubes have changed their position significantly? -> `cubes_moved`.
+        4. **CHECK LINE (Image 2):** Do the moved cubes form a straight horizontal line?
+        5. **CHECK ORDER (Image 2):** Read aligned cubes RIGHT TO LEFT. Compare with Goal: [GT].
 
         OUTPUT FORMAT (Strict JSON):
         {{
+            "n_cubes_detected_start": (int),
+            "n_cubes_detected_end": (int),
+            "cubes_moved": (int),
             "order": ["color1", "color2"], 
             "assessment": true/false, 
             "feedback": "TEXT"
@@ -278,6 +284,7 @@ class CaptureWindow(QtWidgets.QWidget):
         self.pub_text_command = rospy.Publisher('/web_display/text', String, queue_size=1)
         self.sub_web_cmd = rospy.Subscriber('/web/command', String, self.on_web_command_received)
         self.pub_feedback = rospy.Publisher('/web_display/feedback', String, queue_size=1)
+        self.pub_reset_done = rospy.Publisher('/web/reset_done', Empty, queue_size=1)
         self.last_gemini_feedback = "Waiting for analysis..."
 
         
@@ -341,6 +348,8 @@ class CaptureWindow(QtWidgets.QWidget):
         self.pred_is_correct = None
 
         self.reset_path = None
+        self.auto_execute_pending = False
+        self.fixed_colors = ["red", "blue", "green", "yellow"]
         
 
         self.saved_targets_visual = {}   # Guardará { "red": [y_norm, x_norm], ... }
@@ -629,6 +638,8 @@ class CaptureWindow(QtWidgets.QWidget):
     # =========================================================================
 
     def on_reset_clicked(self):
+
+        self.btnExecute.setEnabled(False)
         path = self._capture_reset_photo()
         if not path:
             self.planOut.setPlainText("ERROR: no image captured for reset.")
@@ -640,7 +651,7 @@ class CaptureWindow(QtWidgets.QWidget):
         except Exception as e:
             self.planOut.setPlainText(f"ERROR calling plan_action: {e}")
             return
-
+        
         # Generar targets si no vinieron
         targets_info = self._generate_pseudo_targets(plan, str(path))
         if plan is None: plan = {}
@@ -653,6 +664,8 @@ class CaptureWindow(QtWidgets.QWidget):
         self.btnExecute.setEnabled(True)
         self.countdownLbl.setText("Plan Ready. Press EXECUTE to move robot.")
 
+        
+
         # Visualizar
         try:
             self.planOut.setPlainText(json.dumps(plan, ensure_ascii=False, indent=2))
@@ -663,6 +676,17 @@ class CaptureWindow(QtWidgets.QWidget):
             self._annotate_image_with_plan(str(self.reset_path), plan)
         except Exception as e:
             rospy.logwarn(f"[GUI] overlay error: {e}")
+
+
+        # --- CÓDIGO NUEVO: EL GATILLO AUTOMÁTICO ---
+        if self.auto_execute_pending:
+            rospy.loginfo("Bandera detectada: Ejecutando movimiento automáticamente.")
+            
+            # 1. Bajamos la bandera (para que no se ejecute solo la próxima vez)
+            self.auto_execute_pending = False
+            
+            # 2. Pulsamos EJECUTAR directamente
+            QtCore.QMetaObject.invokeMethod(self.btnExecute, "click")
 
     def on_set_targets_clicked(self):
         """Guarda la posición actual de los cubos como el nuevo OBJETIVO."""
@@ -726,9 +750,26 @@ class CaptureWindow(QtWidgets.QWidget):
         command = msg.data.lower().strip()
         
         if command == "start":
-            rospy.loginfo("Recibido comando START remoto desde la Web.")
+            rospy.loginfo("CMD WEB: START -> BARAJANDO SECUENCIA")
+            
+            # 1. Barajar colores
+            new_sequence = self.fixed_colors.copy()
+            random.shuffle(new_sequence)
+            
+            # 2. Guardar internamente
+            self.gt_order = new_sequence
+            sequence_str = ", ".join(new_sequence)
+            
+            # 3. Enviar a la pantalla del robot (Para el paciente)
+            self.pub_text_command.publish(sequence_str)
+            
+            # 4. ACTUALIZAR GUI DEL PC (Para ti)
+            # Actualizamos la caja de texto donde se ve el Ground Truth
+            self.gtEdit.setText(sequence_str)
+            
+            # 5. Iniciar la captura
             if self.btnStart.isEnabled():
-                self.btnStart.click()
+                QtCore.QMetaObject.invokeMethod(self.btnStart, "click")
                 
         elif command == "stop":
             rospy.loginfo("Recibido comando STOP remoto desde la Web.")
@@ -736,6 +777,15 @@ class CaptureWindow(QtWidgets.QWidget):
             if self.first_done and not self.second_done:
                 # Usamos QMetaObject para llamar a la función en el hilo principal de la GUI
                 QtCore.QMetaObject.invokeMethod(self, "finish_exercise", QtCore.Qt.QueuedConnection)
+        elif command == "reset":
+            rospy.loginfo("CMD WEB: RESET -> PREPARING AUTO-SEQUENCE")
+            
+            # 1. Activamos la bandera: "Cuando tengas el plan, ejecútalo"
+            self.auto_execute_pending = True
+            
+            # 2. Pulsamos el botón que pide el plan a Gemini
+            if self.btnReset.isEnabled():
+                QtCore.QMetaObject.invokeMethod(self.btnReset, "click")
 
     @QtCore.pyqtSlot()  # Decorador recomendado para ser llamado desde invokeMethod
     def finish_exercise(self):
@@ -926,6 +976,9 @@ class CaptureWindow(QtWidgets.QWidget):
         # -------------------------------------------------------------------------
         # 5. FINALIZACIÓN
         # -------------------------------------------------------------------------
+
+        rospy.loginfo("Movimiento finalizado. Avisando a pantalla web.")
+        self.pub_reset_done.publish(Empty())
         self.resultLbl.setText("Sequence Completed!")
         self.countdownLbl.setText("Robot Done.")
 

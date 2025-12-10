@@ -8,12 +8,11 @@
     <!-- 2) Lanzar tus nodos -->
     <node pkg="vlm" type="hello_world.py" name="gui" output="screen"/>
     <node pkg="vlm" type="gemini_vision_server.py" name="gemini" output="screen"/>
-     
     <node pkg="vlm" type="plan_action_server.py" name="plan" output="screen"/> 
     <node pkg="vlm" type="pickup_server.py" name="pick" output="screen"/>
     <node pkg="vlm" type="metrics_server.py" name="metrics" output="screen"/>
     <node pkg="vlm" type="transform_server.py" name="transform" output="screen"/> 
-    <!--<node pkg="vlm" type="tiago_web_display.py" name="web_server" output="screen"/> -->
+    <node pkg="vlm" type="tiago_web_display.py" name="web_server" output="screen"/>
     
     
 

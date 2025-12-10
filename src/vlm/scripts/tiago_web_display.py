@@ -10,7 +10,7 @@ import numpy as np
 import json
 from flask import Flask, Response, jsonify
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import String, Empty
 from cv_bridge import CvBridge, CvBridgeError
 
 # ==========================================
@@ -20,6 +20,7 @@ TOPIC_IMG = '/robot/xdisplay'
 TOPIC_TEXT = '/web_display/text'
 TOPIC_CMD = '/web/command'
 TOPIC_FEEDBACK = '/web_display/feedback'
+TOPIC_RESET_DONE = '/web/reset_done'
 WEB_PORT = 5000
 
 # COLORES
@@ -40,7 +41,8 @@ doing_countdown = False
 pending_text = None 
 current_difficulty = "TEXT" 
 last_received_text = ""
-feedback_ready = False  # <--- NUEVO: Indica si el análisis ha terminado
+feedback_ready = False 
+doing_reset_move = False # Flag para saber si el robot se mueve
 
 # ==========================================
 # CLASE ROS
@@ -51,6 +53,7 @@ class WebDisplayNode:
         self.sub_img = rospy.Subscriber(TOPIC_IMG, Image, self.image_callback)
         self.sub_text = rospy.Subscriber(TOPIC_TEXT, String, self.text_callback)
         self.sub_feedback = rospy.Subscriber(TOPIC_FEEDBACK, String, self.feedback_callback)
+        self.sub_reset_done = rospy.Subscriber(TOPIC_RESET_DONE, Empty, self.reset_done_callback)
         
         global pub_command
         pub_command = rospy.Publisher(TOPIC_CMD, String, queue_size=1)
@@ -71,12 +74,19 @@ class WebDisplayNode:
     def feedback_callback(self, msg):
         global feedback_ready
         rospy.loginfo(f"Feedback recibido: {msg.data}")
-        
-        # 1. Mostrar resultados en la imagen
         show_results_screen(msg.data)
-        
-        # 2. Avisar al navegador que ya puede mostrar el botón Reset
         feedback_ready = True
+
+    def reset_done_callback(self, msg):
+        """Se llama cuando el robot ha terminado físicamente el reset."""
+        global doing_reset_move
+        rospy.loginfo("Reset físico completado. Volviendo a instrucciones.")
+        
+        # 1. Mostrar instrucciones
+        show_instructions()
+        
+        # 2. IMPORTANTE: Bajar la bandera para que el JS sepa que hemos acabado
+        doing_reset_move = False 
 
 # ==========================================
 # UTILIDADES GRÁFICAS
@@ -106,7 +116,11 @@ def show_results_screen(text_report):
     final_lines = []
     
     for explicit_line in explicit_lines:
-        words = explicit_line.split(' ')
+        clean_line = explicit_line.strip()
+        if len(clean_line) > 0:
+            clean_line = clean_line[0].upper() + clean_line[1:]
+        
+        words = clean_line.split(' ')
         current_line = ""
         for word in words:
             if len(current_line) + len(word) < 45:
@@ -269,23 +283,15 @@ def index():
 
             function clickStop() {
                 if (isBusy) return; isBusy = true;
-                
-                // 1. Ocultar botón STOP
                 document.getElementById("btnStop").style.display = "none";
-                
-                // 2. Enviar orden de paro
                 fetch('/trigger_stop');
-
-                // 3. Empezar a preguntar al servidor si ya hay feedback
-                // Comprobamos cada 1 segundo (1000ms)
                 checkInterval = setInterval(() => {
                     fetch('/check_status')
                         .then(response => response.json())
                         .then(data => {
                             if (data.feedback_ready === true) {
-                                // YA LLEGÓ EL FEEDBACK!
-                                clearInterval(checkInterval); // Dejar de preguntar
-                                document.getElementById("btnReset").style.display = "block"; // Mostrar botón
+                                clearInterval(checkInterval); 
+                                document.getElementById("btnReset").style.display = "block";
                                 isBusy = false;
                             }
                         })
@@ -296,14 +302,24 @@ def index():
             function clickReset() {
                 if (isBusy) return;
                 
-                // Limpiar flag visualmente
+                // Ocultar botón inmediatamente
                 document.getElementById("btnReset").style.display = "none";
                 
+                // Iniciar proceso
                 fetch('/trigger_reset');
                 
-                setTimeout(() => {
-                    document.getElementById("btnStart").style.display = "block";
-                    document.getElementById("diffPanel").style.display = "flex";
+                // Chequear cuando el robot termina el movimiento
+                let resetCheckInterval = setInterval(() => {
+                    fetch('/check_status_reset') 
+                        .then(response => response.json())
+                        .then(data => {
+                            if (data.reset_done === true) {
+                                clearInterval(resetCheckInterval);
+                                // AHORA SÍ: Mostramos los controles porque el robot avisó que acabó
+                                document.getElementById("btnStart").style.display = "block";
+                                document.getElementById("diffPanel").style.display = "flex";
+                            }
+                        });
                 }, 1000);
             }
         </script>
@@ -337,20 +353,23 @@ def set_difficulty(mode):
     rospy.loginfo(f"Dificultad cambiada a: {mode}")
     return "OK"
 
-# --- NUEVA RUTA PARA EL SONDEO (POLLING) ---
 @app.route('/check_status')
 def check_status():
     global feedback_ready
     return jsonify({"feedback_ready": feedback_ready})
 
+@app.route('/check_status_reset')
+def check_status_reset():
+    # Comprobamos si la bandera de movimiento ya se apagó
+    global doing_reset_move
+    return jsonify({"reset_done": not doing_reset_move})
+
 @app.route('/trigger_start')
 def trigger_start():
     global doing_countdown, pending_text, feedback_ready
     doing_countdown = True; pending_text = None
-    feedback_ready = False # Reiniciamos el estado
-    
+    feedback_ready = False 
     if pub_command: pub_command.publish("start")
-    
     def visual_countdown():
         global doing_countdown, pending_text
         for i in range(10, 0, -1):
@@ -366,24 +385,36 @@ def trigger_start():
 def trigger_stop():
     global doing_countdown, feedback_ready
     doing_countdown = False
-    feedback_ready = False # Aseguramos que esté falso mientras analiza
-    
+    feedback_ready = False 
     def delayed_stop_sequence():
         for i in range(5, 0, -1):
             update_image_simple_message(f"FINISHING IN {i}...", "REMOVE HANDS", bg_color=(200, 50, 0))
             time.sleep(1.0)
         if pub_command: pub_command.publish("stop")
-        # Mensaje temporal hasta que llegue el feedback
-        update_image_simple_message("ANALYZING!", "Please wait...", bg_color=(0, 100, 50))
+        update_image_simple_message("WELL DONE!", "Analyzing...", bg_color=(0, 100, 50))
     threading.Thread(target=delayed_stop_sequence, daemon=True).start()
     return "OK"
 
 @app.route('/trigger_reset')
 def trigger_reset():
-    global feedback_ready
-    feedback_ready = False # Reset flag
-    if pub_command: pub_command.publish("reset")
-    show_instructions() 
+    global feedback_ready, doing_reset_move
+    feedback_ready = False 
+    doing_reset_move = True # Activamos el modo "movimiento"
+    
+    def safe_reset_sequence():
+        # 1. Advertencia
+        for i in range(5, 0, -1):
+            update_image_simple_message(f"RESETTING IN {i}...", "PLEASE REMOVE HANDS", bg_color=(200, 0, 0))
+            time.sleep(1.0)
+            
+        # 2. Ordenar movimiento
+        if pub_command: pub_command.publish("reset")
+        update_image_simple_message("KEEP HANDS AWAY", "ROBOT MOVING", bg_color=(255, 0, 0))
+        
+        # NOTA: NO cambiamos doing_reset_move aquí.
+        # Esperamos al callback de ROS.
+
+    threading.Thread(target=safe_reset_sequence, daemon=True).start()
     return "OK"
 
 def start_flask(): app.run(host='0.0.0.0', port=WEB_PORT, debug=False, use_reloader=False)
