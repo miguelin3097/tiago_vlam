@@ -187,7 +187,6 @@ DEFAULT_PROMPT = f"""
         - **FORMAT:**
            1. Empathetic message.
            2. Newline (\\n).
-           3. Stats: "Line: [Yes/No] | Order: [Yes/No]"
         """
 DEFAULT_PLAN_PROMPT = (
     "Analyze the image. There are colored cubes on a table. "

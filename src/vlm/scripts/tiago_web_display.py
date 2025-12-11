@@ -92,7 +92,7 @@ class WebDisplayNode:
         global doing_reset_move
         rospy.loginfo("Reset físico completado. Volviendo a instrucciones.")
 
-        move_head_pitch(-0.3) 
+        #move_head_pitch(-0.3) 
         
         # 1. Mostrar instrucciones
         show_instructions()
@@ -188,6 +188,8 @@ def show_results_screen(text_report):
 
 def show_instructions():
     global latest_image
+    move_head_pitch(-0.3)
+    speak_message("Select difficulty and press Start to begin the exercise.")
     img, w, h = create_image_canvas(bg_color=(20, 20, 20))
     font = cv2.FONT_HERSHEY_SIMPLEX
     draw_centered_text(img, "EXERCISE GOAL:", 80, font, 1.0, (180, 180, 180), 2)
@@ -245,9 +247,10 @@ def generate_mjpeg_stream():
     if latest_image is None: 
         show_instructions()
         
+        
         #time.sleep(2.0) # Pequeña pausa para asegurar que el sistema carga
         #rospy.loginfo(f"Pantalla de inicio hablada")
-    speak_message("Select difficulty and press Start to begin the exercise.")
+    
         
     while True:
         with image_lock:
@@ -448,6 +451,7 @@ def trigger_stop():
             update_image_simple_message(f"FINISHING IN {i}...", "REMOVE HANDS", bg_color=(200, 50, 0))
             time.sleep(1.0)
         if pub_command: pub_command.publish("stop")
+        speak_message("Nice try! Let me check your results.")
         update_image_simple_message("NICE TRY!", "Let me check...", bg_color=(0, 100, 50))
     threading.Thread(target=delayed_stop_sequence, daemon=True).start()
     return "OK"
@@ -469,6 +473,7 @@ def trigger_reset():
             
         # 2. Ordenar movimiento
         if pub_command: pub_command.publish("reset")
+        speak_message("Robot moving")
         update_image_simple_message("KEEP HANDS AWAY", "ROBOT MOVING", bg_color=(255, 0, 0))
         
         # NOTA: NO cambiamos doing_reset_move aquí.
