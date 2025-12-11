@@ -12,6 +12,7 @@ from flask import Flask, Response, jsonify
 from sensor_msgs.msg import Image
 from std_msgs.msg import String, Empty
 from cv_bridge import CvBridge, CvBridgeError
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint # <--- NUEVO
 
 # ==========================================
 # CONFIGURACIÓN
@@ -21,6 +22,9 @@ TOPIC_TEXT = '/web_display/text'
 TOPIC_CMD = '/web/command'
 TOPIC_FEEDBACK = '/web_display/feedback'
 TOPIC_RESET_DONE = '/web/reset_done'
+TOPIC_TTS = '/tiago_habla'
+TOPIC_HEAD = '/head_controller/command' 
+
 WEB_PORT = 5000
 
 # COLORES
@@ -35,6 +39,7 @@ app = Flask(__name__)
 latest_image = None
 image_lock = threading.Lock()
 pub_command = None
+pub_tts = None
 
 # VARIABLES DE CONTROL
 doing_countdown = False
@@ -43,6 +48,7 @@ current_difficulty = "TEXT"
 last_received_text = ""
 feedback_ready = False 
 doing_reset_move = False # Flag para saber si el robot se mueve
+startup_spoken = False #
 
 # ==========================================
 # CLASE ROS
@@ -55,8 +61,10 @@ class WebDisplayNode:
         self.sub_feedback = rospy.Subscriber(TOPIC_FEEDBACK, String, self.feedback_callback)
         self.sub_reset_done = rospy.Subscriber(TOPIC_RESET_DONE, Empty, self.reset_done_callback)
         
-        global pub_command
+        global pub_command, pub_tts, pub_head
         pub_command = rospy.Publisher(TOPIC_CMD, String, queue_size=1)
+        pub_tts = rospy.Publisher(TOPIC_TTS, String, queue_size=1)
+        pub_head = rospy.Publisher(TOPIC_HEAD, JointTrajectory, queue_size=1)
 
     def image_callback(self, msg):
         global latest_image
@@ -74,6 +82,8 @@ class WebDisplayNode:
     def feedback_callback(self, msg):
         global feedback_ready
         rospy.loginfo(f"Feedback recibido: {msg.data}")
+        move_head_pitch(-0.3) 
+        speak_message(msg.data)
         show_results_screen(msg.data)
         feedback_ready = True
 
@@ -81,12 +91,46 @@ class WebDisplayNode:
         """Se llama cuando el robot ha terminado físicamente el reset."""
         global doing_reset_move
         rospy.loginfo("Reset físico completado. Volviendo a instrucciones.")
+
+        move_head_pitch(-0.3) 
         
         # 1. Mostrar instrucciones
         show_instructions()
         
         # 2. IMPORTANTE: Bajar la bandera para que el JS sepa que hemos acabado
         doing_reset_move = False 
+
+
+# ==========================================
+# UTILIDAD PARA HABLAR (NUEVA)
+# ==========================================
+def speak_message(text):
+    """Envía un texto al topic de TTS del robot."""
+    if pub_tts:
+        rospy.loginfo(f"Robot dice: '{text}'")
+        pub_tts.publish(text)
+
+# ==========================================
+# UTILIDAD MOVIMIENTO CABEZA
+# ==========================================
+def move_head_pitch(angle_rad):
+    """
+    Mueve la cabeza de TIAGo (head_2_joint).
+    angle_rad: float (ej: 0.0 al frente, -0.6 abajo)
+    """
+    if pub_head:
+        rospy.loginfo(f"Moviendo cabeza a {angle_rad} rad")
+        
+        msg = JointTrajectory()
+        msg.joint_names = ['head_1_joint', 'head_2_joint'] # head_1 es izq/der, head_2 es arriba/abajo
+        
+        point = JointTrajectoryPoint()
+        point.positions = [0.0, angle_rad] # [pan, pitch]
+        point.time_from_start = rospy.Duration(1.0) # Tardar 1 segundo
+        
+        msg.points.append(point)
+        pub_head.publish(msg)
+
 
 # ==========================================
 # UTILIDADES GRÁFICAS
@@ -198,7 +242,13 @@ def update_image_simple_message(main_text, sub_text="", bg_color=(0, 100, 0)):
 # ==========================================
 def generate_mjpeg_stream():
     global latest_image
-    if latest_image is None: show_instructions()
+    if latest_image is None: 
+        show_instructions()
+        
+        #time.sleep(2.0) # Pequeña pausa para asegurar que el sistema carga
+        #rospy.loginfo(f"Pantalla de inicio hablada")
+    speak_message("Select difficulty and press Start to begin the exercise.")
+        
     while True:
         with image_lock:
             frame = latest_image.copy() if latest_image is not None else np.zeros((600,1024,3), np.uint8)
@@ -351,6 +401,7 @@ def set_difficulty(mode):
     global current_difficulty
     current_difficulty = mode
     rospy.loginfo(f"Dificultad cambiada a: {mode}")
+    speak_message(f"Difficulty mode set to {mode}")
     return "OK"
 
 @app.route('/check_status')
@@ -370,11 +421,15 @@ def trigger_start():
     doing_countdown = True; pending_text = None
     feedback_ready = False 
     if pub_command: pub_command.publish("start")
+    move_head_pitch(-0.97) 
+    speak_message("Get ready. Starting in ten seconds.")
     def visual_countdown():
         global doing_countdown, pending_text
         for i in range(10, 0, -1):
             update_image_simple_message(f"STARTING IN {i}...", "Get ready!", bg_color=(200, 100, 0))
             time.sleep(1.0)
+        move_head_pitch(-0.3) 
+        speak_message("Go!")
         doing_countdown = False
         if pending_text: update_image_with_text(pending_text)
         else: update_image_simple_message("GO!", "Exercise running...", bg_color=(0, 0, 100))
@@ -386,12 +441,14 @@ def trigger_stop():
     global doing_countdown, feedback_ready
     doing_countdown = False
     feedback_ready = False 
+    move_head_pitch(-0.97) 
+    speak_message("Finishing exercise.")
     def delayed_stop_sequence():
         for i in range(5, 0, -1):
             update_image_simple_message(f"FINISHING IN {i}...", "REMOVE HANDS", bg_color=(200, 50, 0))
             time.sleep(1.0)
         if pub_command: pub_command.publish("stop")
-        update_image_simple_message("WELL DONE!", "Analyzing...", bg_color=(0, 100, 50))
+        update_image_simple_message("NICE TRY!", "Let me check...", bg_color=(0, 100, 50))
     threading.Thread(target=delayed_stop_sequence, daemon=True).start()
     return "OK"
 
@@ -400,6 +457,9 @@ def trigger_reset():
     global feedback_ready, doing_reset_move
     feedback_ready = False 
     doing_reset_move = True # Activamos el modo "movimiento"
+    move_head_pitch(-0.97)
+
+    speak_message("Resetting table. Keep hands away.")
     
     def safe_reset_sequence():
         # 1. Advertencia

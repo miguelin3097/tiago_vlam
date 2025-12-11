@@ -70,6 +70,7 @@ GeminiAnalyze.srv
 FinalizeSession.srv
 PlanAction.srv
 TransformPose.srv
+Speak.srv
 )
 
 ## Generate actions in the 'action' folder
@@ -185,6 +186,7 @@ catkin_install_python(PROGRAMS
    scripts/pickup_server.py
    scripts/transform_server.py
    scripts/tiago_web_display.py
+   scripts/tts.py
    DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
