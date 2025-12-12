@@ -154,10 +154,6 @@ DEFAULT_PROMPT = f"""
         You are a warm, empathetic rehabilitation assistant talking directly to a patient.
         INPUT: Two images (Start vs End).
         
-        CRITICAL CONTEXT:
-        - Patient sits opposite you.
-        - Patient's "Left-to-Right" is your "Right-to-Left".
-        
         STRICT FILTERING RULES (Do not ignore this):
         1. **DEFINE THE LINE:** Identify the main group of cubes forming a horizontal line.
         2. **EXCLUDE OUTLIERS:** If a cube is NOT part of that straight line (e.g. it is scattered, far away, or left behind), **DO NOT INCLUDE IT** in the JSON "order" list. The "order" list must ONLY contain the aligned cubes.
@@ -167,7 +163,7 @@ DEFAULT_PROMPT = f"""
         2. **COUNT END (Image 2):** Count TOTAL distinct cubes in the second image (both in the line AND scattered outliers) -> `n_cubes_detected_end`.
         3 **COUNT MOVEMENT:** Compare Image 1 vs Image 2. How many cubes have changed their position significantly? -> `cubes_moved`.
         4. **CHECK LINE (Image 2):** Do the moved cubes form a straight horizontal line?
-        5. **CHECK ORDER (Image 2):** Read aligned cubes RIGHT TO LEFT. Compare with Goal: [GT].
+        5. **CHECK ORDER (Image 2):** Read aligned cubes LEFT TO RIGHT. Compare with Goal: [GT].
 
         OUTPUT FORMAT (Strict JSON):
         {{
